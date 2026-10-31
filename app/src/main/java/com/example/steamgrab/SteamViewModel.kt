@@ -8,6 +8,12 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+
+// Batas waktu supaya kalau macet, layar menampilkan langkah yang macet, bukan loading terus.
+// Login dibuat longgar karena kadang menunggu kode Steam Guard dari email.
+private const val LOGIN_TIMEOUT_MS = 180_000L
+private const val GAMES_TIMEOUT_MS = 120_000L
 
 data class GameInfo(val appId: Int, val name: String)
 
@@ -15,7 +21,8 @@ sealed class UiState {
     data class LoggedOut(
         val loading: Boolean = false,
         val error: String? = null,
-        val needsGuardCode: Boolean = false
+        val needsGuardCode: Boolean = false,
+        val status: String? = null
     ) : UiState()
 
     data class GameList(val games: List<GameInfo>) : UiState()
@@ -46,31 +53,38 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         // jangan memulai login baru.
         if (repo.isWaitingForGuard) {
             _uiState.value = if (repo.submitGuardCode(guardCode)) {
-                UiState.LoggedOut(loading = true)
+                UiState.LoggedOut(loading = true, needsGuardCode = true, status = "Mengirim kode Steam Guard...")
             } else {
                 UiState.LoggedOut(needsGuardCode = true, error = "Masukkan kode Steam Guard dulu")
             }
             return
         }
 
-        _uiState.value = UiState.LoggedOut(loading = true)
+        _uiState.value = UiState.LoggedOut(loading = true, status = "Menghubungkan ke Steam...")
         viewModelScope.launch {
+            var step = "login ke Steam"
             try {
-                repo.login(username, password) { type, wrongCode ->
-                    val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
-                    _uiState.value = UiState.LoggedOut(
-                        loading = false,
-                        needsGuardCode = true,
-                        error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
-                    )
+                withTimeout(LOGIN_TIMEOUT_MS) {
+                    repo.login(username.trim(), password) { type, wrongCode ->
+                        val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
+                        _uiState.value = UiState.LoggedOut(
+                            loading = false,
+                            needsGuardCode = true,
+                            error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
+                        )
+                    }
                 }
-                val games = repo.loadOwnedGames().map { GameInfo(it.appId, it.name) }
+
+                step = "mengambil daftar game"
+                _uiState.value = UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
+                val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGames() }
+                val games = owned.map { GameInfo(it.appId, it.name) }
                 ownedGames = games
                 watchingAppId = null
                 _uiState.value = UiState.GameList(games)
             } catch (e: Exception) {
-                Log.e("SteamGrab", "Login gagal", e)
-                _uiState.value = UiState.LoggedOut(error = "Login gagal. Detail:\n${e.describe()}")
+                Log.e("SteamGrab", "Gagal saat $step", e)
+                _uiState.value = UiState.LoggedOut(error = "Gagal saat $step.\nDetail:\n${e.describe()}")
             }
         }
     }

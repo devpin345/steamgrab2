@@ -54,6 +54,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             loading = s.loading,
             error = s.error,
             needsGuardCode = s.needsGuardCode,
+            status = s.status,
             onLogin = { user, pass, guard -> vm.login(user, pass, guard) }
         )
         is UiState.GameList -> GameListScreen(
@@ -83,6 +84,7 @@ fun LoginScreen(
     loading: Boolean,
     error: String?,
     needsGuardCode: Boolean,
+    status: String?,
     onLogin: (String, String, String?) -> Unit
 ) {
     var username by remember { mutableStateOf("") }
@@ -128,6 +130,10 @@ fun LoginScreen(
         }
 
         Spacer(Modifier.height(16.dp))
+        status?.let {
+            Text(it, style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(8.dp))
+        }
         Button(
             onClick = { onLogin(username, password, guardCode.ifBlank { null }) },
             enabled = !loading && username.isNotBlank() && password.isNotBlank(),
