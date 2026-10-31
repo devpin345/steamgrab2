@@ -52,6 +52,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         // Sedang menunggu kode Steam Guard: kirim kodenya ke sesi login yang sudah berjalan,
         // jangan memulai login baru.
         if (repo.isWaitingForGuard) {
+            DebugLog.log("Tombol Kirim kode ditekan")
             _uiState.value = if (repo.submitGuardCode(guardCode)) {
                 UiState.LoggedOut(loading = true, needsGuardCode = true, status = "Mengirim kode Steam Guard...")
             } else {
@@ -60,6 +61,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
+        DebugLog.log("Tombol Login ditekan")
         _uiState.value = UiState.LoggedOut(loading = true, status = "Menghubungkan ke Steam...")
         viewModelScope.launch {
             var step = "login ke Steam"
@@ -75,6 +77,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
 
+                DebugLog.log("Login berhasil, lanjut mengambil daftar game")
                 step = "mengambil daftar game"
                 _uiState.value = UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
                 val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGames() }
@@ -83,6 +86,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 watchingAppId = null
                 _uiState.value = UiState.GameList(games)
             } catch (e: Exception) {
+                DebugLog.log("ERROR saat $step: ${e.describe()}")
                 Log.e("SteamGrab", "Gagal saat $step", e)
                 _uiState.value = UiState.LoggedOut(error = "Gagal saat $step.\nDetail:\n${e.describe()}")
             }

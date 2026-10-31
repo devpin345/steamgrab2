@@ -63,11 +63,13 @@ class SteamRepository private constructor(context: Context) {
     init {
         manager.subscribe(ConnectedCallback::class.java) {
             connected = true
+            DebugLog.log("Terhubung ke server Steam")
             scope.launch { startSession() }
         }
 
         manager.subscribe(DisconnectedCallback::class.java) { cb ->
             connected = false
+            DebugLog.log("Koneksi ke Steam terputus (dibatalkan pengguna: ${cb.isUserInitiated})")
             if (!cb.isUserInitiated) {
                 scope.launch {
                     delay(2000L)
@@ -77,6 +79,7 @@ class SteamRepository private constructor(context: Context) {
         }
 
         manager.subscribe(LoggedOnCallback::class.java) { cb ->
+            DebugLog.log("Steam membalas logOn: ${cb.result}")
             if (cb.result == EResult.OK) {
                 loggedOn.complete(Unit)
             } else {
@@ -87,6 +90,7 @@ class SteamRepository private constructor(context: Context) {
         }
 
         manager.subscribe(LicenseListCallback::class.java) { cb ->
+            DebugLog.log("Daftar lisensi diterima: ${cb.licenseList.size} item (${cb.result})")
             if (cb.result == EResult.OK) {
                 licenses = cb.licenseList
                 licenseSignal.complete(cb.licenseList)
@@ -111,6 +115,7 @@ class SteamRepository private constructor(context: Context) {
         loggedOn = CompletableDeferred()
         licenseSignal = CompletableDeferred()
 
+        DebugLog.log("login: mulai (sudah terhubung: $connected)")
         withContext(Dispatchers.IO) {
             ensurePump()
             if (connected) {
@@ -121,7 +126,9 @@ class SteamRepository private constructor(context: Context) {
         }
 
         loggedOn.await()
+        DebugLog.log("login: loggedOn diterima")
         licenseSignal.await()
+        DebugLog.log("login: daftar lisensi diterima")
     }
 
     /** True jika library sedang menunggu kode Steam Guard dari pengguna. */
@@ -133,6 +140,7 @@ class SteamRepository private constructor(context: Context) {
         val future = pendingGuard ?: return false
         if (code.isNullOrBlank()) return false
         pendingGuard = null
+        DebugLog.log("Kode Steam Guard diteruskan ke library")
         future.complete(code.trim())
         return true
     }
@@ -140,6 +148,7 @@ class SteamRepository private constructor(context: Context) {
     /** Daftar game yang dimiliki akun, nama diambil dari info app Steam. */
     suspend fun loadOwnedGames(): List<OwnedGame> = withContext(Dispatchers.IO) {
         val steamApps = client.getHandler(SteamApps::class.java) ?: error("Sesi Steam belum siap")
+        DebugLog.log("Mengambil daftar game dari Steam...")
 
         // License menunjuk ke package, lalu package berisi daftar app ID
         val packageInfo = steamApps.picsGetProductInfo(
@@ -273,8 +282,12 @@ class SteamRepository private constructor(context: Context) {
                     persistentSession = true
                     authenticator = guardAuthenticator
                 }
+                DebugLog.log("Mengirim login kredensial ke Steam...")
                 val session = client.authentication.beginAuthSessionViaCredentials(details).get()
-                session.pollingWaitForResult().get()
+                DebugLog.log("Sesi login dibuat, menunggu verifikasi...")
+                val poll = session.pollingWaitForResult().get()
+                DebugLog.log("Verifikasi selesai, token diterima")
+                poll
             }
 
             prefs.edit()
@@ -283,6 +296,7 @@ class SteamRepository private constructor(context: Context) {
                 .apply()
             logOn(result.accountName, result.refreshToken)
         } catch (e: Exception) {
+            DebugLog.log("ERROR di startSession: ${e.describe()}")
             loggedOn.completeExceptionally(e)
         }
     }
@@ -294,6 +308,7 @@ class SteamRepository private constructor(context: Context) {
             shouldRememberPassword = true
             loginID = 149
         }
+        DebugLog.log("Mengirim logOn ke Steam...")
         client.getHandler(SteamUser::class.java)?.logOn(details)
     }
 
@@ -312,6 +327,7 @@ class SteamRepository private constructor(context: Context) {
     private fun askGuardCode(type: GuardType, wrongCode: Boolean): CompletableFuture<String> {
         val future = CompletableFuture<String>()
         pendingGuard = future
+        DebugLog.log("Steam meminta kode Steam Guard (${type.name.lowercase()}, kode sebelumnya salah: $wrongCode)")
         onGuardNeeded?.invoke(type, wrongCode)
         return future
     }

@@ -5,13 +5,20 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.provider.Settings
+import android.view.Menu
+import android.view.MenuItem
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -20,11 +27,30 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 
+private const val MENU_DEBUG = 1
+
 class MainActivity : ComponentActivity() {
+    // Tombol Debug di pojok kanan atas (action bar)
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menu.add(0, MENU_DEBUG, 0, "Debug").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        if (item.itemId == MENU_DEBUG) {
+            DebugLog.setVisible(true)
+            return true
+        }
+        return super.onOptionsItemSelected(item)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -48,6 +74,9 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+
+    val showDebug by DebugLog.visible.collectAsState()
+    if (showDebug) DebugDialog(onClose = { DebugLog.setVisible(false) })
 
     when (val s = state) {
         is UiState.LoggedOut -> LoginScreen(
@@ -75,6 +104,46 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             message = s.message,
             onBack = { vm.backToList() }
         )
+    }
+}
+
+/** Layar debug: log dengan jam, tombol Salin, Bersihkan, dan Tutup. Dibuka lewat dialog supaya isian login tidak hilang. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun DebugDialog(onClose: () -> Unit) {
+    val lines by DebugLog.lines.collectAsState()
+    val context = LocalContext.current
+
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxSize().padding(16.dp)) {
+                Text("Debug", style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(8.dp))
+                Row {
+                    Button(onClick = {
+                        val cm = context.getSystemService(ClipboardManager::class.java)
+                        cm.setPrimaryClip(ClipData.newPlainText("SteamGrab log", DebugLog.text()))
+                        Toast.makeText(context, "Log disalin", Toast.LENGTH_SHORT).show()
+                    }) { Text("Salin") }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = { DebugLog.clear() }) { Text("Bersihkan") }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = onClose) { Text("Tutup") }
+                }
+                Spacer(Modifier.height(12.dp))
+                Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                    SelectionContainer {
+                        Text(
+                            text = if (lines.isEmpty()) "(belum ada log)" else lines.joinToString("\n"),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
