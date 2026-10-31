@@ -38,6 +38,9 @@ data class OwnedGame(val appId: Int, val name: String)
 
 enum class GuardType { DEVICE, EMAIL }
 
+/** Keadaan satu depot dari listener library: byte terkompresi, byte tidak terkompresi, dan persennya (0..1). */
+internal class DepotProgress(val compressed: Long, val uncompressed: Long, val percent: Float)
+
 /**
  * Satu sesi Steam per proses. Dipakai bersama oleh ViewModel dan DownloadService.
  * Alurnya mengikuti Sample 023 JavaSteam: login dengan kredensial sekali,
@@ -197,10 +200,11 @@ class SteamRepository private constructor(context: Context) {
      * Mengunduh satu game ke Download/SteamGames/steamapps/common/<installdir>,
      * lalu menulis appmanifest_<appid>.acf. Melempar exception jika gagal atau dibatalkan.
      * Pembatalan dilakukan dengan membatalkan coroutine pemanggilnya.
+     * [onProgress] dipanggil setiap ada chunk yang selesai, dengan progres semua depot digabung.
      */
-    suspend fun downloadGame(appId: Int, onProgress: (Float, String) -> Unit): File =
+    suspend fun downloadGame(appId: Int, onProgress: (DownloadProgress) -> Unit): File =
         withContext(Dispatchers.IO) {
-            val depotSizes = ConcurrentHashMap<Int, Pair<Long, Long>>() // depotId -> (compressed, uncompressed)
+            val depots = ConcurrentHashMap<Int, DepotProgress>()
             val failure = AtomicReference<Throwable?>(null)
 
             val listener = object : IDownloadListener {
@@ -210,11 +214,13 @@ class SteamRepository private constructor(context: Context) {
                     compressedBytes: Long,
                     uncompressedBytes: Long
                 ) {
-                    onProgress(depotPercentComplete, "Depot $depotId · ${compressedBytes / 1_000_000} MB")
+                    depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, depotPercentComplete)
+                    onProgress(summarize(depots))
                 }
 
                 override fun onDepotCompleted(depotId: Int, compressedBytes: Long, uncompressedBytes: Long) {
-                    depotSizes[depotId] = compressedBytes to uncompressedBytes
+                    depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, 1f)
+                    onProgress(summarize(depots))
                 }
 
                 override fun onDownloadFailed(item: DownloadItem, error: Throwable) {
@@ -251,7 +257,7 @@ class SteamRepository private constructor(context: Context) {
                 val installDir = app.keyValues["config"]["installdir"].asString()
                     ?: error("Nama folder install untuk app $appId kosong")
 
-                writeAppManifest(app, installDir, depotSizes.toMap())
+                writeAppManifest(app, installDir, depots.mapValues { it.value.compressed to it.value.uncompressed })
                 Storage.gameDir(installDir)
             } finally {
                 downloader.close()
@@ -259,6 +265,21 @@ class SteamRepository private constructor(context: Context) {
         }
 
     // ---- helper ----
+
+    /**
+     * Menggabungkan progres semua depot. Total diperkirakan dari persen tiap depot,
+     * jadi masih perkiraan sampai ukuran dari manifest tersedia.
+     */
+    private fun summarize(depots: Map<Int, DepotProgress>): DownloadProgress {
+        var done = 0.0
+        var total = 0.0
+        for (d in depots.values) {
+            done += d.compressed
+            if (d.percent > 0f) total += d.compressed / d.percent.toDouble()
+        }
+        val percent = if (total > 0.0) (done / total).toFloat().coerceIn(0f, 1f) else 0f
+        return DownloadProgress(doneBytes = done.toLong(), totalBytes = total.toLong(), percent = percent)
+    }
 
     private fun ensurePump() {
         if (pumpStarted) return

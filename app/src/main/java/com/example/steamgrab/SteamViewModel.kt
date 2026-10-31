@@ -26,7 +26,15 @@ sealed class UiState {
     ) : UiState()
 
     data class GameList(val games: List<GameInfo>) : UiState()
-    data class Downloading(val progress: Float, val gameName: String, val status: String) : UiState()
+
+    data class Downloading(
+        val appId: Int,
+        val gameName: String,
+        val progress: DownloadProgress,
+        val speedBps: Long,
+        val speedHistory: List<Long>,
+    ) : UiState()
+
     data class Done(val savedPath: String) : UiState()
     data class Error(val message: String) : UiState()
 }
@@ -94,9 +102,16 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startDownload(appId: Int) {
+        // Hanya satu download dalam satu waktu. Kalau masih ada yang berjalan, tampilkan progres itu.
+        if (DownloadService.status.value is DownloadStatus.Running) {
+            DebugLog.log("Masih ada download yang berjalan, menampilkan progresnya")
+            openRunningDownload()
+            return
+        }
+
         val game = ownedGames.find { it.appId == appId } ?: return
         watchingAppId = appId
-        _uiState.value = UiState.Downloading(0f, game.name, "Memulai...")
+        _uiState.value = UiState.Downloading(appId, game.name, DownloadProgress(), 0L, emptyList())
 
         val ctx = getApplication<Application>()
         ctx.startForegroundService(
@@ -104,6 +119,13 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 .putExtra(DownloadService.EXTRA_APP_ID, appId)
                 .putExtra(DownloadService.EXTRA_NAME, game.name)
         )
+    }
+
+    /** Membuka kembali halaman download yang sedang berjalan di latar belakang. */
+    fun openRunningDownload() {
+        val running = DownloadService.status.value as? DownloadStatus.Running ?: return
+        watchingAppId = running.appId
+        _uiState.value = running.toUi()
     }
 
     fun cancelDownload() {
@@ -114,6 +136,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         ctx.startService(Intent(ctx, DownloadService::class.java).setAction(DownloadService.ACTION_STOP))
     }
 
+    /** Kembali ke daftar. Download yang sedang berjalan tetap lanjut di latar belakang. */
     fun backToList() {
         watchingAppId = null
         _uiState.value = UiState.GameList(ownedGames)
@@ -124,7 +147,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         when (status) {
             is DownloadStatus.Running -> {
                 if (status.appId == watching) {
-                    _uiState.value = UiState.Downloading(status.progress, status.name, status.text)
+                    _uiState.value = status.toUi()
                 }
             }
             is DownloadStatus.Finished -> {
@@ -142,4 +165,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             DownloadStatus.Idle -> Unit
         }
     }
+
+    private fun DownloadStatus.Running.toUi(): UiState.Downloading =
+        UiState.Downloading(appId, name, progress, speedBps, speedHistory)
 }

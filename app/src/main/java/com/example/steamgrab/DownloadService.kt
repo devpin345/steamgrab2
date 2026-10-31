@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -18,20 +19,30 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 sealed class DownloadStatus {
     object Idle : DownloadStatus()
-    data class Running(val appId: Int, val name: String, val progress: Float, val text: String) : DownloadStatus()
+    data class Running(
+        val appId: Int,
+        val name: String,
+        val progress: DownloadProgress,
+        val speedBps: Long,
+        val speedHistory: List<Long>,
+    ) : DownloadStatus()
     data class Finished(val appId: Int, val path: String) : DownloadStatus()
     data class Failed(val appId: Int, val message: String) : DownloadStatus()
 }
 
 /**
  * Menjalankan download di foreground service supaya tetap jalan saat layar mati atau app di background.
+ * Hanya satu download dalam satu waktu. Setiap detik status dan notifikasi diperbarui
+ * (logo, persen, ukuran, dan kecepatan).
  */
 class DownloadService : Service() {
 
@@ -39,7 +50,13 @@ class DownloadService : Service() {
     private var job: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
-    private var lastNotifyMs = 0L
+
+    private var currentAppId = -1
+    private var currentName = ""
+    @Volatile private var latest = DownloadProgress()
+    @Volatile private var largeIcon: Bitmap? = null
+    @Volatile private var publishing = false
+    private val meter = SpeedMeter()
 
     override fun onCreate() {
         super.onCreate()
@@ -54,36 +71,58 @@ class DownloadService : Service() {
             return START_NOT_STICKY
         }
 
+        // Harus dipanggil segera setelah startForegroundService, termasuk saat permintaan ini diabaikan.
+        // Notifikasi download yang sedang berjalan dipertahankan, tidak diganti.
+        if (job?.isActive == true) {
+            startForegroundCompat(buildNotification(currentName, latest, meter.speedBps))
+            return START_NOT_STICKY
+        }
+
         val appId = intent?.getIntExtra(EXTRA_APP_ID, -1) ?: -1
         val name = intent?.getStringExtra(EXTRA_NAME) ?: "App $appId"
-
-        // Harus dipanggil segera setelah startForegroundService, walau request ini akan diabaikan.
-        startForegroundCompat(buildNotification(name, "Menyiapkan download...", 0f))
+        startForegroundCompat(buildNotification(name, DownloadProgress(), 0L))
 
         if (appId <= 0) {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (job?.isActive == true) return START_NOT_STICKY // sudah ada download yang berjalan
 
         acquireLocks()
-        _status.value = DownloadStatus.Running(appId, name, 0f, "Menyiapkan download...")
+        currentAppId = appId
+        currentName = name
+        latest = DownloadProgress()
+        largeIcon = null
+        meter.start(0L, System.currentTimeMillis())
+        publishing = true
+        publish()
 
         job = scope.launch {
-            try {
-                val dir = SteamRepository.get(applicationContext).downloadGame(appId) { percent, text ->
-                    publishProgress(appId, name, percent, text)
+            // Setiap detik: catat kecepatan lalu perbarui status dan notifikasi
+            val ticker = launch {
+                while (isActive) {
+                    delay(TICK_MS)
+                    meter.sample(latest.doneBytes, System.currentTimeMillis())
+                    publish()
                 }
+            }
+            try {
+                largeIcon = GameImages.load(appId)
+                val dir = SteamRepository.get(applicationContext).downloadGame(appId) { p -> latest = p }
+                publishing = false
                 _status.value = DownloadStatus.Finished(appId, dir.absolutePath)
                 postResult("Selesai: $name")
             } catch (e: CancellationException) {
+                publishing = false
                 _status.value = DownloadStatus.Idle
                 throw e
             } catch (e: Exception) {
+                publishing = false
                 val msg = e.describe()
                 _status.value = DownloadStatus.Failed(appId, msg)
                 postResult("Gagal: ${msg.lineSequence().first()}")
             } finally {
+                publishing = false
+                ticker.cancel()
                 releaseLocks()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -101,15 +140,14 @@ class DownloadService : Service() {
         super.onDestroy()
     }
 
-    private fun publishProgress(appId: Int, name: String, percent: Float, text: String) {
-        _status.value = DownloadStatus.Running(appId, name, percent, text)
-
-        // Notifikasi diperbarui maksimal sekali per detik supaya tidak membebani sistem
-        val now = System.currentTimeMillis()
-        if (now - lastNotifyMs < NOTIFY_INTERVAL_MS) return
-        lastNotifyMs = now
+    /** Mengirim keadaan terbaru ke UI dan notifikasi. Dipanggil tiap detik oleh ticker. */
+    private fun publish() {
+        if (!publishing) return
+        val p = latest
+        val speed = meter.speedBps
+        _status.value = DownloadStatus.Running(currentAppId, currentName, p, speed, meter.history())
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_ID, buildNotification(name, text, percent))
+            .notify(NOTIF_ID, buildNotification(currentName, p, speed))
     }
 
     private fun acquireLocks() {
@@ -136,20 +174,41 @@ class DownloadService : Service() {
         }
     }
 
-    private fun buildNotification(title: String, text: String, percent: Float): Notification {
+    /**
+     * Notifikasi berisi logo game, judul dengan persen, bar progres, ukuran, dan kecepatan.
+     * Ketuk notifikasi untuk membuka aplikasi.
+     */
+    private fun buildNotification(title: String, p: DownloadProgress, speedBps: Long): Notification {
+        val pct = (p.percent * 100).toInt().coerceIn(0, 100)
+        val known = p.totalBytes > 0L
+
         val stopIntent = PendingIntent.getService(
             this, 0,
             Intent(this, DownloadService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setProgress(100, (percent * 100).toInt().coerceIn(0, 100), false)
+            .setContentTitle(if (known) "$title · $pct%" else title)
+            .setContentText(
+                if (known) "${formatBytes(p.doneBytes)} / ${formatBytes(p.totalBytes)} · ${formatSpeed(speedBps)}"
+                else "Menyiapkan download..."
+            )
+            .setContentIntent(openIntent)
+            .setOnlyAlertOnce(true)
             .setOngoing(true)
             .addAction(0, "Batal", stopIntent)
-            .build()
+
+        if (known) builder.setProgress(100, pct, false) else builder.setProgress(0, 0, true)
+        largeIcon?.let { builder.setLargeIcon(it) }
+
+        return builder.build()
     }
 
     private fun postResult(text: String) {
@@ -170,7 +229,7 @@ class DownloadService : Service() {
         private const val CHANNEL_ID = "download"
         private const val NOTIF_ID = 1
         private const val NOTIF_DONE_ID = 2
-        private const val NOTIFY_INTERVAL_MS = 1000L
+        private const val TICK_MS = 1000L
 
         private val _status = MutableStateFlow<DownloadStatus>(DownloadStatus.Idle)
         val status: StateFlow<DownloadStatus> = _status.asStateFlow()
