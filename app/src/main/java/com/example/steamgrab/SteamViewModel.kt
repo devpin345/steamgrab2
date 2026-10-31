@@ -2,6 +2,7 @@ package com.example.steamgrab
 
 import android.app.Application
 import android.content.Intent
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -68,7 +69,8 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 watchingAppId = null
                 _uiState.value = UiState.GameList(games)
             } catch (e: Exception) {
-                _uiState.value = UiState.LoggedOut(error = e.message ?: "Login gagal")
+                Log.e("SteamGrab", "Login gagal", e)
+                _uiState.value = UiState.LoggedOut(error = "Login gagal. Detail:\n${e.describe()}")
             }
         }
     }

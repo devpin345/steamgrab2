@@ -80,9 +80,9 @@ class DownloadService : Service() {
                 _status.value = DownloadStatus.Idle
                 throw e
             } catch (e: Exception) {
-                val msg = e.message ?: "Download gagal"
+                val msg = e.describe()
                 _status.value = DownloadStatus.Failed(appId, msg)
-                postResult("Gagal: $msg")
+                postResult("Gagal: ${msg.lineSequence().first()}")
             } finally {
                 releaseLocks()
                 stopForeground(STOP_FOREGROUND_REMOVE)

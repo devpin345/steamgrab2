@@ -10,7 +10,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -75,6 +77,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun LoginScreen(
     loading: Boolean,
@@ -118,7 +121,10 @@ fun LoginScreen(
 
         error?.let {
             Spacer(Modifier.height(8.dp))
-            Text(it, color = MaterialTheme.colorScheme.error)
+            // SelectionContainer supaya teks error bisa disalin dan dikirim ke pengembang
+            SelectionContainer {
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
         }
 
         Spacer(Modifier.height(16.dp))
