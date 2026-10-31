@@ -53,6 +53,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        DebugLog.init(applicationContext)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -106,6 +107,21 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         )
     }
 }
+
+enum class LibraryFilter { ALL, INSTALLED, NOT_INSTALLED }
+
+/** App ID game yang appmanifest-nya ada di folder steamapps, artinya sudah diunduh. */
+private fun installedAppIds(): Set<Int> =
+    Storage.steamLibraryDir().listFiles()
+        ?.mapNotNull { f ->
+            if (f.name.startsWith("appmanifest_") && f.name.endsWith(".acf")) {
+                f.name.removePrefix("appmanifest_").removeSuffix(".acf").toIntOrNull()
+            } else {
+                null
+            }
+        }
+        ?.toSet()
+        ?: emptySet()
 
 /** Layar debug: log dengan jam, tombol Salin, Bersihkan, dan Tutup. Dibuka lewat dialog supaya isian login tidak hilang. */
 @OptIn(ExperimentalFoundationApi::class)
@@ -216,10 +232,53 @@ fun LoginScreen(
 
 @Composable
 fun GameListScreen(games: List<GameInfo>, onSelect: (Int) -> Unit) {
+    var query by remember { mutableStateOf("") }
+    var filter by remember { mutableStateOf(LibraryFilter.ALL) }
+    val installed = remember(games) { installedAppIds() }
+
+    val shown = games.filter { game ->
+        (query.isBlank() || game.name.contains(query, ignoreCase = true)) &&
+            when (filter) {
+                LibraryFilter.ALL -> true
+                LibraryFilter.INSTALLED -> game.appId in installed
+                LibraryFilter.NOT_INSTALLED -> game.appId !in installed
+            }
+    }
+
     val context = LocalContext.current
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Pilih Game", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            label = { Text("Cari game") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = filter == LibraryFilter.ALL,
+                onClick = { filter = LibraryFilter.ALL },
+                label = { Text("Semua") }
+            )
+            FilterChip(
+                selected = filter == LibraryFilter.INSTALLED,
+                onClick = { filter = LibraryFilter.INSTALLED },
+                label = { Text("Sudah diunduh") }
+            )
+            FilterChip(
+                selected = filter == LibraryFilter.NOT_INSTALLED,
+                onClick = { filter = LibraryFilter.NOT_INSTALLED },
+                label = { Text("Belum") }
+            )
+        }
+        Text(
+            "${shown.size} dari ${games.size} game · semua dimiliki akun",
+            style = MaterialTheme.typography.bodySmall
+        )
 
         if (!Storage.hasAllFilesAccess()) {
             Spacer(Modifier.height(8.dp))
@@ -239,10 +298,13 @@ fun GameListScreen(games: List<GameInfo>, onSelect: (Int) -> Unit) {
 
         Spacer(Modifier.height(12.dp))
         LazyColumn {
-            items(games) { game ->
+            items(shown) { game ->
+                val done = game.appId in installed
                 ListItem(
                     headlineContent = { Text(game.name) },
-                    supportingContent = { Text("App ID: ${game.appId}") },
+                    supportingContent = {
+                        Text(if (done) "App ID ${game.appId} · Sudah diunduh" else "App ID ${game.appId} · Dimiliki")
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { onSelect(game.appId) }

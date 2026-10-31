@@ -21,6 +21,7 @@ import `in`.dragonbra.javasteam.steam.steamclient.callbackmgr.CallbackManager
 import `in`.dragonbra.javasteam.steam.steamclient.callbacks.ConnectedCallback
 import `in`.dragonbra.javasteam.steam.steamclient.callbacks.DisconnectedCallback
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -47,7 +48,12 @@ class SteamRepository private constructor(context: Context) {
     private val prefs = context.getSharedPreferences("steam_session", Context.MODE_PRIVATE)
     private val client = SteamClient()
     private val manager = CallbackManager(client)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Error yang tidak tertangkap di coroutine latar belakang dicatat, bukan membuat aplikasi tertutup
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e ->
+            DebugLog.log("ERROR latar belakang: ${e.describe()}")
+        }
+    )
 
     private var licenses: List<License> = emptyList()
     private var pendingUser: String? = null
@@ -163,6 +169,7 @@ class SteamRepository private constructor(context: Context) {
 
         val tokens = steamApps.picsGetAccessTokens(appIds, emptyList<Int>()).await().appTokens
         val names = HashMap<Int, String>()
+        val types = HashMap<Int, String>()
 
         appIds.chunked(200).forEach { chunk ->
             val res = steamApps.picsGetProductInfo(
@@ -170,11 +177,18 @@ class SteamRepository private constructor(context: Context) {
                 emptyList<PICSRequest>()
             ).await()
             res.results.flatMap { it.apps.values }.forEach { app ->
-                app.keyValues["common"]["name"].asString()?.let { names[app.id] = it }
+                app.keyValues["common"]["name"].asString()
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { names[app.id] = it }
+                app.keyValues["common"]["type"].asString()?.let { types[app.id] = it.lowercase() }
             }
         }
 
+        DebugLog.log("Daftar app: ${appIds.size} ID, ${types.size} punya tipe")
+
         appIds
+            // Hanya game. DLC, demo, dan tool disembunyikan. Tipe yang tidak diketahui tetap ditampilkan.
+            .filter { types[it] == null || types[it] == "game" }
             .map { OwnedGame(it, names[it] ?: "App $it") }
             .sortedBy { it.name.lowercase() }
     }
@@ -253,7 +267,12 @@ class SteamRepository private constructor(context: Context) {
         // (itu sebabnya proses login dijalankan di scope terpisah).
         scope.launch {
             while (isActive) {
-                manager.runWaitCallbacks(1000L)
+                try {
+                    manager.runWaitCallbacks(1000L)
+                } catch (e: Exception) {
+                    // Satu callback yang gagal tidak boleh menghentikan seluruh pemrosesan pesan Steam
+                    DebugLog.log("ERROR di pemroses pesan Steam: ${e.describe()}")
+                }
             }
         }
     }
