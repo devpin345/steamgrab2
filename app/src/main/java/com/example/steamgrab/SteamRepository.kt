@@ -314,6 +314,10 @@ class SteamRepository private constructor(context: Context) {
                 .putString(KEY_TOKEN, result.refreshToken)
                 .apply()
             logOn(result.accountName, result.refreshToken)
+        } catch (e: java.util.concurrent.CancellationException) {
+            // Koneksi putus di tengah login membatalkan permintaan ke Steam. Login dimulai ulang
+            // otomatis saat tersambung lagi, jadi error tidak ditampilkan dulu.
+            DebugLog.log("Login terhenti karena koneksi putus, menunggu sambung ulang")
         } catch (e: Exception) {
             DebugLog.log("ERROR di startSession: ${e.describe()}")
             loggedOn.completeExceptionally(e)
