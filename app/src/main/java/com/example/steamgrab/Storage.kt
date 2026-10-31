@@ -15,7 +15,7 @@ import java.io.File
 object Storage {
 
     fun steamLibraryDir(): File = File(
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOAD),
+        Environment.getExternalStoragePublicDirectory("Download"),
         "SteamGames/steamapps"
     )
 

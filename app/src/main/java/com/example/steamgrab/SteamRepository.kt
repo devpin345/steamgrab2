@@ -204,14 +204,15 @@ class SteamRepository private constructor(context: Context) {
             try {
                 downloader.addListener(listener)
                 downloader.add(
-                    AppItem.Builder(appId)
-                        .installToGameNameDirectory(true)
-                        .installDirectory(Storage.commonDir().absolutePath)
-                        .branch("public")
-                        .os("windows")
-                        .osArch("64")
-                        .language("english")
-                        .build()
+                    AppItem(
+                        appId = appId,
+                        installToGameNameDirectory = true,
+                        installDirectory = Storage.commonDir().absolutePath,
+                        branch = "public",
+                        os = "windows",
+                        osArch = "64",
+                        language = "english",
+                    )
                 )
                 downloader.finishAdding()
 
