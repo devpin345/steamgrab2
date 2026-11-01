@@ -34,6 +34,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import `in`.dragonbra.javasteam.steam.cdn.Client as CdnClient
 import `in`.dragonbra.javasteam.steam.handlers.steamcontent.SteamContent
+import `in`.dragonbra.javasteam.steam.steamclient.AsyncJobFailedException
 import `in`.dragonbra.javasteam.types.KeyValue
 import java.util.concurrent.atomic.AtomicReference
 
@@ -76,6 +77,8 @@ class SteamRepository private constructor(context: Context) {
     @Volatile private var pendingGuard: CompletableFuture<String>? = null
     @Volatile private var connected = false
     private var pumpStarted = false
+    // Dikirim ke UI saat status koneksi berubah (misalnya sedang menyambung ulang saat menunggu kode)
+    @Volatile private var onStatus: ((String) -> Unit)? = null
 
     private var loggedOn = CompletableDeferred<Unit>()
     private var licenseSignal = CompletableDeferred<List<License>>()
@@ -91,6 +94,10 @@ class SteamRepository private constructor(context: Context) {
             connected = false
             DebugLog.log("Koneksi ke Steam terputus (dibatalkan pengguna: ${cb.isUserInitiated})")
             if (!cb.isUserInitiated) {
+                // Kode yang sedang ditunggu ikut batal. Setelah tersambung, Steam akan meminta kode lagi.
+                pendingGuard?.cancel(false)
+                pendingGuard = null
+                onStatus?.invoke("Koneksi ke Steam terputus, menyambung ulang...")
                 scope.launch {
                     delay(2000L)
                     client.connect()
@@ -127,11 +134,13 @@ class SteamRepository private constructor(context: Context) {
     suspend fun login(
         username: String,
         password: String,
-        onGuardCodeNeeded: (GuardType, Boolean) -> Unit
+        onGuardCodeNeeded: (GuardType, Boolean) -> Unit,
+        onStatus: (String) -> Unit = {},
     ) {
         pendingUser = username
         pendingPass = password
         onGuardNeeded = onGuardCodeNeeded
+        this.onStatus = onStatus
         loggedOn = CompletableDeferred()
         licenseSignal = CompletableDeferred()
 
@@ -204,6 +213,8 @@ class SteamRepository private constructor(context: Context) {
         appIds
             // Hanya game. DLC, demo, dan tool disembunyikan. Tipe yang tidak diketahui tetap ditampilkan.
             .filter { types[it] == null || types[it] == "game" }
+            // Game tanpa depot untuk Windows 64-bit (misalnya server dedicated) tidak bisa diunduh, jadi disembunyikan
+            .filter { appInfos[it]?.let { kv -> selectedDepots(kv).isNotEmpty() } ?: true }
             .map { OwnedGame(it, names[it] ?: "App $it") }
             .sortedBy { it.name.lowercase() }
     }
@@ -291,10 +302,11 @@ class SteamRepository private constructor(context: Context) {
 
                 // Memakai delay (bisa dibatalkan), bukan awaitCompletion() yang memblokir
                 val completion = downloader.getCompletion()
-                while (!completion.isDone) {
+                // Berhenti juga kalau library sudah melaporkan kegagalan, supaya tidak menunggu selamanya
+                while (!completion.isDone && failure.get() == null) {
                     delay(500L)
                 }
-                failure.get()?.let { throw it }
+                failure.get()?.let { throw friendlyError(it) }
                 completion.get()
 
                 val app = fetchAppInfo(appId) ?: error("Info app $appId tidak ditemukan di Steam")
@@ -341,16 +353,27 @@ class SteamRepository private constructor(context: Context) {
                     .await()
                 if (code == 0L) error("Steam tidak memberi izin untuk manifest depot $depotId")
 
-                val auth = steamContent.getCDNAuthToken(appId, depotId, server.host!!, this).await()
-                if (auth.result != EResult.OK) error("Token CDN depot $depotId ditolak: ${auth.result}")
-
-                val manifest = cdn.downloadManifest(
-                    depotId = depotId,
-                    manifestId = manifestId,
-                    manifestRequestCode = code.toULong(),
-                    server = server,
-                    cdnAuthToken = auth.token,
-                )
+                // Coba tanpa token dulu. Token baru diminta kalau server menolak, sama seperti yang dilakukan library.
+                val manifest = try {
+                    cdn.downloadManifest(
+                        depotId = depotId,
+                        manifestId = manifestId,
+                        manifestRequestCode = code.toULong(),
+                        server = server,
+                    )
+                } catch (e: Exception) {
+                    if (!isActive) throw e
+                    DebugLog.log("Manifest depot $depotId ditolak tanpa token, mencoba dengan token: ${e.describe()}")
+                    val auth = steamContent.getCDNAuthToken(appId, depotId, server.host!!, this).await()
+                    if (auth.result != EResult.OK) error("Token CDN depot $depotId ditolak: ${auth.result}")
+                    cdn.downloadManifest(
+                        depotId = depotId,
+                        manifestId = manifestId,
+                        manifestRequestCode = code.toULong(),
+                        server = server,
+                        cdnAuthToken = auth.token,
+                    )
+                }
                 download += manifest.totalCompressedSize
                 disk += manifest.totalUncompressedSize
             }
@@ -414,6 +437,20 @@ class SteamRepository private constructor(context: Context) {
         else -> "Menyiapkan download..." to "lain"
     }
 
+    /** Kegagalan karena koneksi putus (termasuk di dalam cause), bukan karena password atau kode salah. */
+    private fun Throwable.isConnectionLoss(): Boolean =
+        generateSequence(this) { it.cause }.any {
+            it is AsyncJobFailedException || it is java.util.concurrent.CancellationException
+        }
+
+    /** Pesan yang lebih jelas untuk error dari library. */
+    private fun friendlyError(e: Throwable): Throwable =
+        if (generateSequence(e) { it.cause }.any { it.message?.contains("find any depots") == true }) {
+            IllegalStateException("Game ini tidak punya file untuk Windows 64-bit")
+        } else {
+            e
+        }
+
     private fun ensurePump() {
         if (pumpStarted) return
         pumpStarted = true
@@ -473,6 +510,12 @@ class SteamRepository private constructor(context: Context) {
             // otomatis saat tersambung lagi, jadi error tidak ditampilkan dulu.
             DebugLog.log("Login terhenti karena koneksi putus, menunggu sambung ulang")
         } catch (e: Exception) {
+            if (!connected || e.isConnectionLoss()) {
+                // Koneksi putus di tengah login. Setelah tersambung lagi, startSession dijalankan ulang
+                // dan layar login tetap menunggu, jadi error ini tidak dikirim ke UI.
+                DebugLog.log("Login terputus di tengah jalan, menunggu sambung ulang: ${e.describe()}")
+                return
+            }
             DebugLog.log("ERROR di startSession: ${e.describe()}")
             loggedOn.completeExceptionally(e)
         }

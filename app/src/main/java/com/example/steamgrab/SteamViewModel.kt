@@ -67,6 +67,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     private var ownedGames: List<GameInfo> = emptyList()
     private var watchingAppId: Int? = null
     private var sizeJob: Job? = null
+    private var loginJob: Job? = null
 
     init {
         // Status download datang dari DownloadService, UI hanya menampilkannya
@@ -88,20 +89,47 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
+        // Login sebelumnya masih berjalan (misalnya menunggu koneksi kembali). Jangan mulai yang kedua,
+        // karena dua login bersamaan akan saling menimpa status.
+        if (loginJob?.isActive == true) {
+            DebugLog.log("Tombol Login diabaikan, login sebelumnya masih berjalan")
+            val current = _uiState.value
+            if (current is UiState.LoggedOut) {
+                _uiState.value = current.copy(error = "Login masih berjalan, tunggu sebentar")
+            }
+            return
+        }
+
         DebugLog.log("Tombol Login ditekan")
         _uiState.value = UiState.LoggedOut(loading = true, status = "Menghubungkan ke Steam...")
-        viewModelScope.launch {
+        loginJob = viewModelScope.launch {
             var step = "login ke Steam"
             try {
                 withTimeout(LOGIN_TIMEOUT_MS) {
-                    repo.login(username.trim(), password) { type, wrongCode ->
-                        val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
-                        _uiState.value = UiState.LoggedOut(
-                            loading = false,
-                            needsGuardCode = true,
-                            error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
-                        )
-                    }
+                    repo.login(
+                        username = username.trim(),
+                        password = password,
+                        onGuardCodeNeeded = { type, wrongCode ->
+                            val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
+                            _uiState.value = UiState.LoggedOut(
+                                loading = false,
+                                needsGuardCode = true,
+                                error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
+                            )
+                        },
+                        onStatus = { message ->
+                            // Hanya di layar login. Kolom kode tetap tampil supaya kode bisa diketik lagi
+                            // setelah Steam meminta kode baru.
+                            val current = _uiState.value
+                            if (current is UiState.LoggedOut) {
+                                _uiState.value = UiState.LoggedOut(
+                                    loading = true,
+                                    needsGuardCode = current.needsGuardCode,
+                                    status = message
+                                )
+                            }
+                        }
+                    )
                 }
 
                 DebugLog.log("Login berhasil, lanjut mengambil daftar game")
