@@ -43,5 +43,11 @@ dependencies {
     // Enum dari javasteam (EAuthSessionGuardType) mewarisi kelas protobuf. Tanpa ini kompilasi gagal.
     // Versi sama dengan yang dipakai library (gradle/libs.versions.toml di JavaSteam).
     implementation "com.google.protobuf:protobuf-java:4.35.1"
+    // JavaSteam memasang dua library dekompresi ini sebagai compileOnly, jadi tidak ikut masuk APK.
+    // Tanpa xz, download langsung crash dengan NoClassDefFoundError org.tukaani.xz.LZMAInputStream
+    // karena chunk game dikompres LZMA. Versi sama dengan gradle/libs.versions.toml di JavaSteam.
+    implementation "org.tukaani:xz:1.12"
+    // Chunk yang dikompres zstd. Varian @aar membawa library native untuk Android.
+    implementation "com.github.luben:zstd-jni:1.5.7-11@aar"
     implementation "com.madgag.spongycastle:prov:1.58.0.0"
 }

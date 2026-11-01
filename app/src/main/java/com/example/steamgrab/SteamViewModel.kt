@@ -201,10 +201,10 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             DebugLog.log("Ukuran game belum diketahui, download tetap dicoba: ${e.describe()}")
             return null
         }
-        val installDir = repo.installDirOf(appId)
-        val existing = if (installDir != null) Storage.existingBytes(installDir) else 0L
-        // Yang perlu disediakan hanya bagian yang belum ada di folder
-        val needed = (size.disk - existing).coerceAtLeast(0L)
+        // Selalu pakai ukuran penuh. Library mengalokasikan panjang file di awal sebelum datanya tiba,
+        // jadi ukuran file di folder tidak menunjukkan berapa yang sudah benar-benar terunduh.
+        // Mengurangi ukuran itu membuat kebutuhan terhitung 0 B pada percobaan kedua.
+        val needed = size.disk
         val free = Storage.freeBytes()
         DebugLog.log("Cek ruang: butuh ${formatBytes(needed)}, tersedia ${formatBytes(free)}")
         return needed to free

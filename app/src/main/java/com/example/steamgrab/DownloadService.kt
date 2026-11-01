@@ -137,7 +137,9 @@ class DownloadService : Service() {
                     _status.value = DownloadStatus.Idle
                 }
                 throw e
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // Throwable, bukan Exception: kelas yang hilang (NoClassDefFoundError) adalah Error.
+                // Kalau hanya Exception yang ditangkap, aplikasi langsung berhenti tanpa pesan.
                 finished = true
                 val msg = e.describe()
                 DebugLog.log("Download gagal: $msg")

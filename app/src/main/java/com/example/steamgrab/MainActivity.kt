@@ -41,6 +41,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -48,6 +49,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 
 private const val MENU_DEBUG = 1
@@ -101,6 +104,52 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
 
     val showDebug by DebugLog.visible.collectAsState()
     if (showDebug) DebugDialog(onClose = { DebugLog.setVisible(false) })
+
+    // Izin akses semua file diminta di awal, sebelum login dan sebelum daftar game muncul.
+    // Statusnya dicek ulang setiap aplikasi kembali ke layar (setelah pengguna dari pengaturan),
+    // jadi popup hilang sendiri begitu izin diberikan.
+    val context = LocalContext.current
+    var hasAccess by remember { mutableStateOf(Storage.hasAllFilesAccess()) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) hasAccess = Storage.hasAllFilesAccess()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    if (!hasAccess) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Izin penyimpanan dibutuhkan") },
+            text = {
+                Text(
+                    "SteamGrab menyimpan game ke folder Download/SteamGames di penyimpanan ponsel " +
+                        "supaya bisa dipindahkan ke PC lewat USB. Tanpa izin akses semua file, " +
+                        "aplikasi tidak bisa menulis ke folder itu dan tidak bisa menghitung ruang " +
+                        "yang dibutuhkan dengan benar.\n\n" +
+                        "Tekan tombol di bawah, lalu aktifkan \"Izinkan akses untuk mengelola semua file\"."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        try {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                            )
+                        } catch (e: Exception) {
+                            // Sebagian ponsel tidak punya halaman izin per aplikasi, buka daftar umumnya
+                            context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                        }
+                    }
+                }) { Text("Buka pengaturan izin") }
+            }
+        )
+    }
 
     when (val s = state) {
         is UiState.LoggedOut -> LoginScreen(
@@ -337,8 +386,6 @@ fun GameListScreen(
             }
     }
 
-    val context = LocalContext.current
-
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Pilih Game", style = MaterialTheme.typography.headlineSmall)
 
@@ -391,22 +438,6 @@ fun GameListScreen(
             "${shown.size} dari ${games.size} game · semua dimiliki akun",
             style = MaterialTheme.typography.bodySmall
         )
-
-        if (!Storage.hasAllFilesAccess()) {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "Izin akses semua file belum aktif. Tanpa izin ini hasil download tidak bisa dibuka dari PC.",
-                color = MaterialTheme.colorScheme.error
-            )
-            TextButton(onClick = {
-                context.startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        Uri.parse("package:${context.packageName}")
-                    )
-                )
-            }) { Text("Buka pengaturan izin") }
-        }
 
         Spacer(Modifier.height(12.dp))
         LazyColumn {
