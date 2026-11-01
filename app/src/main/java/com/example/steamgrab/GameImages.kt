@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Gambar header game dari CDN Steam (publik, tanpa login). Disimpan di memori
@@ -21,6 +22,11 @@ object GameImages {
         override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount
     }
 
+    // Game yang tidak punya gambar header (misalnya tool) dicatat supaya tidak diminta lagi
+    // setiap kali daftar digambar ulang. Gangguan jaringan tidak dicatat, jadi akan dicoba lagi.
+    private val missing: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    private val warned: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+
     fun headerUrl(appId: Int): String =
         "https://cdn.akamai.steamstatic.com/steam/apps/$appId/header.jpg"
 
@@ -30,15 +36,24 @@ object GameImages {
     /** Mengambil gambar header. Mengembalikan null kalau gagal, supaya UI tetap tampil dengan placeholder. */
     suspend fun load(appId: Int): Bitmap? = withContext(Dispatchers.IO) {
         cache.get(appId)?.let { return@withContext it }
-        val bitmap = try {
-            val conn = URL(headerUrl(appId)).openConnection() as HttpURLConnection
+        if (appId in missing) return@withContext null
+
+        val conn = URL(headerUrl(appId)).openConnection() as HttpURLConnection
+        try {
             conn.connectTimeout = 10_000
             conn.readTimeout = 15_000
-            conn.inputStream.use { BitmapFactory.decodeStream(it) }
+            if (conn.responseCode == HttpURLConnection.HTTP_NOT_FOUND) {
+                missing.add(appId)
+                if (warned.add(appId)) DebugLog.log("Game $appId tidak punya gambar header, dilewati")
+                return@withContext null
+            }
+            val bitmap = conn.inputStream.use { BitmapFactory.decodeStream(it) }
+            bitmap?.also { cache.put(appId, it) }
         } catch (e: IOException) {
-            DebugLog.log("Gambar game $appId tidak bisa dimuat: ${e.message}")
+            if (warned.add(appId)) DebugLog.log("Gambar game $appId gagal dimuat: ${e.message}")
             null
+        } finally {
+            conn.disconnect()
         }
-        bitmap?.also { cache.put(appId, it) }
     }
 }

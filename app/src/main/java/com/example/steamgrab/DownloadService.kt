@@ -35,27 +35,34 @@ sealed class DownloadStatus {
         val speedBps: Long,
         val speedHistory: List<Long>,
     ) : DownloadStatus()
+    data class Paused(val appId: Int, val name: String, val progress: DownloadProgress) : DownloadStatus()
     data class Finished(val appId: Int, val path: String) : DownloadStatus()
     data class Failed(val appId: Int, val message: String) : DownloadStatus()
 }
 
 /**
  * Menjalankan download di foreground service supaya tetap jalan saat layar mati atau app di background.
- * Hanya satu download dalam satu waktu. Setiap detik status dan notifikasi diperbarui
- * (logo, persen, ukuran, dan kecepatan).
+ * Hanya satu download dalam satu waktu. Setiap detik status dan notifikasi diperbarui.
+ *
+ * Jeda dilakukan dengan membatalkan download. Byte yang sudah tersimpan tetap di disk,
+ * dan saat dilanjutkan library memeriksa file yang ada lalu hanya mengunduh bagian yang belum ada.
  */
 class DownloadService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var job: Job? = null
+    @Volatile private var job: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+
+    // Nomor setiap download dimulai. Sisa proses download lama tidak boleh mengganggu download baru.
+    @Volatile private var generation = 0
+    @Volatile private var finished = false
+    @Volatile private var pauseRequested = false
 
     private var currentAppId = -1
     private var currentName = ""
     @Volatile private var latest = DownloadProgress()
     @Volatile private var largeIcon: Bitmap? = null
-    @Volatile private var publishing = false
     private val meter = SpeedMeter()
 
     override fun onCreate() {
@@ -66,8 +73,14 @@ class DownloadService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            if (job?.isActive == true) job?.cancel() else stopSelf()
+        val action = intent?.action
+        if (action == ACTION_STOP || action == ACTION_PAUSE) {
+            if (job?.isActive == true) {
+                pauseRequested = action == ACTION_PAUSE
+                job?.cancel()
+            } else {
+                stopSelf()
+            }
             return START_NOT_STICKY
         }
 
@@ -87,14 +100,16 @@ class DownloadService : Service() {
             return START_NOT_STICKY
         }
 
+        val gen = ++generation
         acquireLocks()
+        finished = false
+        pauseRequested = false
         currentAppId = appId
         currentName = name
         latest = DownloadProgress()
         largeIcon = null
         meter.start(0L, System.currentTimeMillis())
-        publishing = true
-        publish()
+        publish(gen)
 
         job = scope.launch {
             // Setiap detik: catat kecepatan lalu perbarui status dan notifikasi
@@ -102,30 +117,40 @@ class DownloadService : Service() {
                 while (isActive) {
                     delay(TICK_MS)
                     meter.sample(latest.doneBytes, System.currentTimeMillis())
-                    publish()
+                    publish(gen)
                 }
             }
             try {
                 largeIcon = GameImages.load(appId)
                 val dir = SteamRepository.get(applicationContext).downloadGame(appId) { p -> latest = p }
-                publishing = false
+                finished = true
                 _status.value = DownloadStatus.Finished(appId, dir.absolutePath)
                 postResult("Selesai: $name")
             } catch (e: CancellationException) {
-                publishing = false
-                _status.value = DownloadStatus.Idle
+                finished = true
+                if (pauseRequested) {
+                    DebugLog.log("Download dijeda")
+                    _status.value = DownloadStatus.Paused(appId, name, latest)
+                    postResult("Dijeda: $name. Buka aplikasi untuk melanjutkan.")
+                } else {
+                    DebugLog.log("Download dibatalkan")
+                    _status.value = DownloadStatus.Idle
+                }
                 throw e
             } catch (e: Exception) {
-                publishing = false
+                finished = true
                 val msg = e.describe()
+                DebugLog.log("Download gagal: $msg")
                 _status.value = DownloadStatus.Failed(appId, msg)
                 postResult("Gagal: ${msg.lineSequence().first()}")
             } finally {
-                publishing = false
                 ticker.cancel()
-                releaseLocks()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                // Kalau pengguna sudah memulai download lain, service itu tidak boleh dimatikan di sini
+                if (gen == generation) {
+                    releaseLocks()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
         return START_NOT_STICKY
@@ -140,9 +165,9 @@ class DownloadService : Service() {
         super.onDestroy()
     }
 
-    /** Mengirim keadaan terbaru ke UI dan notifikasi. Dipanggil tiap detik oleh ticker. */
-    private fun publish() {
-        if (!publishing) return
+    /** Mengirim keadaan terbaru ke UI dan notifikasi. Dipanggil saat mulai dan tiap detik oleh ticker. */
+    private fun publish(gen: Int) {
+        if (gen != generation || finished) return
         val p = latest
         val speed = meter.speedBps
         _status.value = DownloadStatus.Running(currentAppId, currentName, p, speed, meter.history())
@@ -151,6 +176,7 @@ class DownloadService : Service() {
     }
 
     private fun acquireLocks() {
+        releaseLocks()
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SteamGrab:download")
             .apply { acquire() }
@@ -176,7 +202,7 @@ class DownloadService : Service() {
 
     /**
      * Notifikasi berisi logo game, judul dengan persen, bar progres, ukuran, dan kecepatan.
-     * Ketuk notifikasi untuk membuka aplikasi.
+     * Sebelum byte game masuk, teks menampilkan tahap yang sedang dikerjakan.
      */
     private fun buildNotification(title: String, p: DownloadProgress, speedBps: Long): Notification {
         val pct = (p.percent * 100).toInt().coerceIn(0, 100)
@@ -195,14 +221,15 @@ class DownloadService : Service() {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle(if (known) "$title · $pct%" else title)
+            .setContentTitle("$title · $pct%")
             .setContentText(
                 if (known) "${formatBytes(p.doneBytes)} / ${formatBytes(p.totalBytes)} · ${formatSpeed(speedBps)}"
-                else "Menyiapkan download..."
+                else p.phase.ifBlank { "Menyiapkan download..." }
             )
             .setContentIntent(openIntent)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
+            .addAction(0, "Jeda", pauseIntent())
             .addAction(0, "Batal", stopIntent)
 
         if (known) builder.setProgress(100, pct, false) else builder.setProgress(0, 0, true)
@@ -210,6 +237,12 @@ class DownloadService : Service() {
 
         return builder.build()
     }
+
+    private fun pauseIntent(): PendingIntent = PendingIntent.getService(
+        this, 1,
+        Intent(this, DownloadService::class.java).setAction(ACTION_PAUSE),
+        PendingIntent.FLAG_IMMUTABLE
+    )
 
     private fun postResult(text: String) {
         val n = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -223,6 +256,7 @@ class DownloadService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.example.steamgrab.STOP"
+        const val ACTION_PAUSE = "com.example.steamgrab.PAUSE"
         const val EXTRA_APP_ID = "app_id"
         const val EXTRA_NAME = "name"
 

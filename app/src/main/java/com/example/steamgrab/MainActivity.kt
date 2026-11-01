@@ -112,6 +112,8 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         )
         is UiState.Downloading -> DownloadScreen(
             state = s,
+            onPause = { vm.pauseDownload() },
+            onResume = { appId -> vm.resumeDownload(appId) },
             onCancel = { vm.cancelDownload() },
             onBack = { vm.backToList() }
         )
@@ -269,14 +271,19 @@ fun GameListScreen(games: List<GameInfo>, onSelect: (Int) -> Unit, onOpenDownloa
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Pilih Game", style = MaterialTheme.typography.headlineSmall)
 
-        // Download yang sedang berjalan di latar belakang, ketuk untuk melihat progresnya
-        (running as? DownloadStatus.Running)?.let { r ->
+        // Download yang sedang berjalan atau dijeda. Ketuk untuk membuka halaman progresnya.
+        val banner: Triple<String, DownloadProgress, String>? = when (val st = running) {
+            is DownloadStatus.Running -> Triple(st.name, st.progress, "sedang diunduh")
+            is DownloadStatus.Paused -> Triple(st.name, st.progress, "dijeda")
+            else -> null
+        }
+        banner?.let { (name, progress, label) ->
             Spacer(Modifier.height(8.dp))
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.fillMaxWidth().clickable(onClick = onOpenDownload).padding(12.dp)) {
-                    Text("Sedang diunduh: ${r.name}", style = MaterialTheme.typography.titleSmall)
+                    Text("$name $label", style = MaterialTheme.typography.titleSmall)
                     Text(
-                        "${(r.progress.percent * 100).toInt()}% · ketuk untuk melihat",
+                        "${(progress.percent * 100).toInt()}% · ketuk untuk melihat",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -376,11 +383,24 @@ fun GameHeader(appId: Int, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun DownloadScreen(state: UiState.Downloading, onCancel: () -> Unit, onBack: () -> Unit) {
+fun DownloadScreen(
+    state: UiState.Downloading,
+    onPause: () -> Unit,
+    onResume: (Int) -> Unit,
+    onCancel: () -> Unit,
+    onBack: () -> Unit
+) {
     val p = state.progress
     val pct = (p.percent * 100).toInt().coerceIn(0, 100)
     val known = p.totalBytes > 0L
     val barColor = MaterialTheme.colorScheme.primary
+
+    // Baris keterangan: saat dijeda, saat ukuran sudah diketahui, atau tahap yang sedang berjalan
+    val statusLine = when {
+        state.paused -> "Dijeda. ${formatBytes(p.doneBytes)} sudah diunduh dan tidak hilang."
+        known -> "Sudah diunduh ${formatBytes(p.doneBytes)} dari ${formatBytes(p.totalBytes)}"
+        else -> p.phase.ifBlank { "Menyiapkan download..." }
+    }
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         GameHeader(appId = state.appId, modifier = Modifier.width(220.dp))
@@ -392,11 +412,7 @@ fun DownloadScreen(state: UiState.Downloading, onCancel: () -> Unit, onBack: () 
             overflow = TextOverflow.Ellipsis
         )
         Spacer(Modifier.height(4.dp))
-        Text(
-            if (known) "Sudah diunduh ${formatBytes(p.doneBytes)} dari ${formatBytes(p.totalBytes)}"
-            else "Menyiapkan download...",
-            style = MaterialTheme.typography.bodyMedium
-        )
+        Text(statusLine, style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(16.dp))
 
         Row(Modifier.fillMaxWidth().height(220.dp)) {
@@ -436,15 +452,24 @@ fun DownloadScreen(state: UiState.Downloading, onCancel: () -> Unit, onBack: () 
         }
 
         Spacer(Modifier.height(16.dp))
-        Text(
-            "Download tetap berjalan walau layar dikunci atau aplikasi ditutup. Pantau dari notifikasi.",
-            style = MaterialTheme.typography.bodySmall
-        )
-        Spacer(Modifier.height(16.dp))
+        if (!state.paused) {
+            Text(
+                "Download tetap berjalan walau layar dikunci atau aplikasi ditutup. Pantau dari notifikasi.",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Spacer(Modifier.height(16.dp))
+        }
+
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onBack) { Text("Ke daftar game") }
+            if (state.paused) {
+                Button(onClick = { onResume(state.appId) }) { Text("Lanjutkan") }
+            } else {
+                Button(onClick = onPause) { Text("Jeda") }
+            }
             OutlinedButton(onClick = onCancel) { Text("Batal") }
         }
+        Spacer(Modifier.height(8.dp))
+        TextButton(onClick = onBack) { Text("Ke daftar game") }
     }
 }
 

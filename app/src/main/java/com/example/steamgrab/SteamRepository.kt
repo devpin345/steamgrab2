@@ -204,10 +204,29 @@ class SteamRepository private constructor(context: Context) {
      */
     suspend fun downloadGame(appId: Int, onProgress: (DownloadProgress) -> Unit): File =
         withContext(Dispatchers.IO) {
+            DebugLog.log("Download game $appId dimulai")
             val depots = ConcurrentHashMap<Int, DepotProgress>()
             val failure = AtomicReference<Throwable?>(null)
+            // Tahap yang sedang dikerjakan library sebelum chunk pertama masuk (manifest, alokasi, validasi)
+            val phase = AtomicReference("Menyiapkan download...")
+            val category = AtomicReference("")
 
             val listener = object : IDownloadListener {
+                override fun onStatusUpdate(message: String) {
+                    val (text, cat) = phaseOf(message)
+                    phase.set(text)
+                    // Hanya dicatat saat tahap berganti, supaya log tidak penuh oleh tiap file
+                    if (category.getAndSet(cat) != cat) DebugLog.log("Tahap: $text")
+                }
+
+                override fun onItemAdded(item: DownloadItem) {
+                    DebugLog.log("Library menerima permintaan download")
+                }
+
+                override fun onDownloadStarted(item: DownloadItem) {
+                    DebugLog.log("Library mulai memproses download")
+                }
+
                 override fun onChunkCompleted(
                     depotId: Int,
                     depotPercentComplete: Float,
@@ -215,15 +234,28 @@ class SteamRepository private constructor(context: Context) {
                     uncompressedBytes: Long
                 ) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, depotPercentComplete)
-                    onProgress(summarize(depots))
+                    onProgress(summarize(depots, phase.get()))
+                }
+
+                override fun onFileCompleted(depotId: Int, fileName: String, depotPercentComplete: Float) {
+                    // Untuk file kecil yang hanya terdiri dari satu chunk, persen hanya datang dari sini
+                    val prev = depots[depotId]
+                    depots[depotId] = DepotProgress(
+                        prev?.compressed ?: 0L,
+                        prev?.uncompressed ?: 0L,
+                        depotPercentComplete
+                    )
+                    onProgress(summarize(depots, phase.get()))
                 }
 
                 override fun onDepotCompleted(depotId: Int, compressedBytes: Long, uncompressedBytes: Long) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, 1f)
-                    onProgress(summarize(depots))
+                    DebugLog.log("Depot $depotId selesai (${formatBytes(compressedBytes)})")
+                    onProgress(summarize(depots, phase.get()))
                 }
 
                 override fun onDownloadFailed(item: DownloadItem, error: Throwable) {
+                    DebugLog.log("Library gagal: ${error.describe()}")
                     failure.set(error)
                 }
             }
@@ -270,7 +302,7 @@ class SteamRepository private constructor(context: Context) {
      * Menggabungkan progres semua depot. Total diperkirakan dari persen tiap depot,
      * jadi masih perkiraan sampai ukuran dari manifest tersedia.
      */
-    private fun summarize(depots: Map<Int, DepotProgress>): DownloadProgress {
+    private fun summarize(depots: Map<Int, DepotProgress>, phase: String): DownloadProgress {
         var done = 0.0
         var total = 0.0
         for (d in depots.values) {
@@ -278,7 +310,20 @@ class SteamRepository private constructor(context: Context) {
             if (d.percent > 0f) total += d.compressed / d.percent.toDouble()
         }
         val percent = if (total > 0.0) (done / total).toFloat().coerceIn(0f, 1f) else 0f
-        return DownloadProgress(doneBytes = done.toLong(), totalBytes = total.toLong(), percent = percent)
+        return DownloadProgress(
+            doneBytes = done.toLong(),
+            totalBytes = total.toLong(),
+            percent = percent,
+            phase = phase
+        )
+    }
+
+    /** Menerjemahkan pesan tahap dari library ke teks Indonesia, plus kategorinya untuk keperluan log. */
+    private fun phaseOf(message: String): Pair<String, String> = when {
+        message.startsWith("Downloading manifest") -> "Mengunduh daftar file dari Steam..." to "manifest"
+        message.startsWith("Allocating file") -> "Menyiapkan file di penyimpanan..." to "alokasi"
+        message.startsWith("Validating") -> "Memeriksa file yang sudah ada..." to "validasi"
+        else -> "Menyiapkan download..." to "lain"
     }
 
     private fun ensurePump() {

@@ -33,6 +33,7 @@ sealed class UiState {
         val progress: DownloadProgress,
         val speedBps: Long,
         val speedHistory: List<Long>,
+        val paused: Boolean = false,
     ) : UiState()
 
     data class Done(val savedPath: String) : UiState()
@@ -121,11 +122,31 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    /** Membuka kembali halaman download yang sedang berjalan di latar belakang. */
+    /** Membuka kembali halaman download yang sedang berjalan atau dijeda di latar belakang. */
     fun openRunningDownload() {
-        val running = DownloadService.status.value as? DownloadStatus.Running ?: return
-        watchingAppId = running.appId
-        _uiState.value = running.toUi()
+        when (val st = DownloadService.status.value) {
+            is DownloadStatus.Running -> {
+                watchingAppId = st.appId
+                _uiState.value = st.toUi()
+            }
+            is DownloadStatus.Paused -> {
+                watchingAppId = st.appId
+                _uiState.value = st.toUi()
+            }
+            else -> Unit
+        }
+    }
+
+    fun pauseDownload() {
+        DebugLog.log("Tombol Jeda ditekan")
+        val ctx = getApplication<Application>()
+        ctx.startService(Intent(ctx, DownloadService::class.java).setAction(DownloadService.ACTION_PAUSE))
+    }
+
+    /** Melanjutkan download yang dijeda. File yang sudah ada dicek ulang, lalu hanya bagian yang belum ada diunduh. */
+    fun resumeDownload(appId: Int) {
+        DebugLog.log("Tombol Lanjutkan ditekan")
+        startDownload(appId)
     }
 
     fun cancelDownload() {
@@ -150,6 +171,11 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                     _uiState.value = status.toUi()
                 }
             }
+            is DownloadStatus.Paused -> {
+                if (status.appId == watching) {
+                    _uiState.value = status.toUi()
+                }
+            }
             is DownloadStatus.Finished -> {
                 if (status.appId == watching) {
                     watchingAppId = null
@@ -168,4 +194,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun DownloadStatus.Running.toUi(): UiState.Downloading =
         UiState.Downloading(appId, name, progress, speedBps, speedHistory)
+
+    private fun DownloadStatus.Paused.toUi(): UiState.Downloading =
+        UiState.Downloading(appId, name, progress, 0L, emptyList(), paused = true)
 }

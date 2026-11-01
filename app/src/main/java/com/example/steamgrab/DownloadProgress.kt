@@ -13,6 +13,8 @@ data class DownloadProgress(
     val doneBytes: Long = 0L,
     val totalBytes: Long = 0L,
     val percent: Float = 0f,
+    // Tahap yang sedang dikerjakan library sebelum byte game mulai masuk (manifest, alokasi, validasi)
+    val phase: String = "",
 )
 
 /** Menghitung kecepatan per detik dari selisih byte, dan menyimpan riwayatnya untuk grafik. */
