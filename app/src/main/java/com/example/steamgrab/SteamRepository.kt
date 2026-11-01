@@ -32,6 +32,9 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import `in`.dragonbra.javasteam.steam.cdn.Client as CdnClient
+import `in`.dragonbra.javasteam.steam.handlers.steamcontent.SteamContent
+import `in`.dragonbra.javasteam.types.KeyValue
 import java.util.concurrent.atomic.AtomicReference
 
 data class OwnedGame(val appId: Int, val name: String)
@@ -59,6 +62,14 @@ class SteamRepository private constructor(context: Context) {
     )
 
     private var licenses: List<License> = emptyList()
+
+    // Info app dari PICS (depot, manifest, nama folder). Diisi saat daftar game diambil,
+    // dipakai untuk menghitung ukuran tanpa meminta info yang sama lagi.
+    private val appInfos = ConcurrentHashMap<Int, KeyValue>()
+
+    init {
+        GameSizeStore.init(context)
+    }
     private var pendingUser: String? = null
     private var pendingPass: String? = null
     private var onGuardNeeded: ((GuardType, Boolean) -> Unit)? = null
@@ -184,6 +195,7 @@ class SteamRepository private constructor(context: Context) {
                     ?.takeIf { it.isNotBlank() }
                     ?.let { names[app.id] = it }
                 app.keyValues["common"]["type"].asString()?.let { types[app.id] = it.lowercase() }
+                appInfos[app.id] = app.keyValues
             }
         }
 
@@ -234,7 +246,7 @@ class SteamRepository private constructor(context: Context) {
                     uncompressedBytes: Long
                 ) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, depotPercentComplete)
-                    onProgress(summarize(depots, phase.get()))
+                    onProgress(summarize(depots, phase.get(), GameSizeStore.get(appId)?.download))
                 }
 
                 override fun onFileCompleted(depotId: Int, fileName: String, depotPercentComplete: Float) {
@@ -245,13 +257,13 @@ class SteamRepository private constructor(context: Context) {
                         prev?.uncompressed ?: 0L,
                         depotPercentComplete
                     )
-                    onProgress(summarize(depots, phase.get()))
+                    onProgress(summarize(depots, phase.get(), GameSizeStore.get(appId)?.download))
                 }
 
                 override fun onDepotCompleted(depotId: Int, compressedBytes: Long, uncompressedBytes: Long) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, 1f)
                     DebugLog.log("Depot $depotId selesai (${formatBytes(compressedBytes)})")
-                    onProgress(summarize(depots, phase.get()))
+                    onProgress(summarize(depots, phase.get(), GameSizeStore.get(appId)?.download))
                 }
 
                 override fun onDownloadFailed(item: DownloadItem, error: Throwable) {
@@ -296,19 +308,95 @@ class SteamRepository private constructor(context: Context) {
             }
         }
 
+    /** Nama folder install game (config/installdir), atau null kalau info app belum ada. */
+    fun installDirOf(appId: Int): String? =
+        appInfos[appId]?.let { it["config"]["installdir"].asString() }
+
+    /**
+     * Menghitung ukuran game dari manifest tiap depot. Manifest itu kecil, jadi jauh lebih ringan
+     * daripada mengunduh isi game. Pilihan depot sama dengan yang dipakai library saat download.
+     */
+    suspend fun computeDownloadSize(appId: Int): GameSize = withContext(Dispatchers.IO) {
+        val kv = appInfos[appId] ?: error("Info app $appId belum dimuat")
+        val steamContent = client.getHandler(SteamContent::class.java) ?: error("Sesi Steam belum siap")
+        val depots = selectedDepots(kv)
+        if (depots.isEmpty()) return@withContext GameSize(0L, 0L)
+
+        val server = steamContent.getServersForSteamPipe(
+            cellId = client.cellID ?: 0,
+            parentScope = this
+        ).await()
+            .filter { (it.type == "SteamCache" || it.type == "CDN") && !it.useAsProxy }
+            .filter { it.allowedAppIds.isEmpty() || it.allowedAppIds.contains(appId) }
+            .minByOrNull { it.weightedLoad }
+            ?: error("Tidak ada server CDN yang tersedia")
+
+        val cdn = CdnClient(client)
+        try {
+            var download = 0L
+            var disk = 0L
+            for ((depotId, manifestId) in depots) {
+                val code = steamContent
+                    .getManifestRequestCode(depotId, appId, manifestId, "public", null, this)
+                    .await()
+                if (code == 0L) error("Steam tidak memberi izin untuk manifest depot $depotId")
+
+                val auth = steamContent.getCDNAuthToken(appId, depotId, server.host!!, this).await()
+                if (auth.result != EResult.OK) error("Token CDN depot $depotId ditolak: ${auth.result}")
+
+                val manifest = cdn.downloadManifest(
+                    depotId = depotId,
+                    manifestId = manifestId,
+                    manifestRequestCode = code.toULong(),
+                    server = server,
+                    cdnAuthToken = auth.token,
+                )
+                download += manifest.totalCompressedSize
+                disk += manifest.totalUncompressedSize
+            }
+            GameSize(download, disk)
+        } finally {
+            cdn.close()
+        }
+    }
+
+    /** Depot untuk Windows 64-bit bahasa Inggris, beserta ID manifest publiknya. */
+    private fun selectedDepots(kv: KeyValue): List<Pair<Int, Long>> =
+        kv["depots"].children.mapNotNull { section ->
+            val depotId = section.name?.toIntOrNull() ?: return@mapNotNull null
+            if (section.children.isEmpty()) return@mapNotNull null
+
+            val cfg = section["config"]
+            if (cfg != KeyValue.INVALID) {
+                val osList = cfg["oslist"].value
+                if (!osList.isNullOrBlank() && "windows" !in osList.split(",")) return@mapNotNull null
+                val osArch = cfg["osarch"].value
+                if (!osArch.isNullOrBlank() && osArch != "64") return@mapNotNull null
+                val language = cfg["language"].value
+                if (!language.isNullOrBlank() && language != "english") return@mapNotNull null
+                if (cfg["lowviolence"].asBoolean()) return@mapNotNull null
+            }
+
+            val manifestId = section["manifests"]["public"]["gid"].asString()?.toLongOrNull()
+                ?: return@mapNotNull null
+            depotId to manifestId
+        }
+
     // ---- helper ----
 
     /**
      * Menggabungkan progres semua depot. Total diperkirakan dari persen tiap depot,
      * jadi masih perkiraan sampai ukuran dari manifest tersedia.
      */
-    private fun summarize(depots: Map<Int, DepotProgress>, phase: String): DownloadProgress {
+    private fun summarize(depots: Map<Int, DepotProgress>, phase: String, knownTotal: Long?): DownloadProgress {
         var done = 0.0
         var total = 0.0
         for (d in depots.values) {
             done += d.compressed
             if (d.percent > 0f) total += d.compressed / d.percent.toDouble()
         }
+        // Kalau ukuran dari manifest sudah diketahui, pakai itu. Lebih akurat daripada perkiraan dari persen.
+        if (knownTotal != null && knownTotal > 0L) total = knownTotal.toDouble()
         val percent = if (total > 0.0) (done / total).toFloat().coerceIn(0f, 1f) else 0f
         return DownloadProgress(
             doneBytes = done.toLong(),

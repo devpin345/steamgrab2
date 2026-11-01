@@ -85,6 +85,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     val state by vm.uiState.collectAsState()
+    val sizes by vm.sizes.collectAsState()
+    val sizesLoading by vm.sizesLoading.collectAsState()
+    val storageAlert by vm.storageAlert.collectAsState()
 
     // Notifikasi dibutuhkan agar progres download terlihat di Android 13 ke atas
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -107,7 +110,9 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         )
         is UiState.GameList -> GameListScreen(
             games = s.games,
-            onSelect = { appId -> vm.startDownload(appId) },
+            sizes = sizes,
+            sizesLoading = sizesLoading,
+            onSelect = { appId -> vm.requestDownload(appId) },
             onOpenDownload = { vm.openRunningDownload() }
         )
         is UiState.Downloading -> DownloadScreen(
@@ -124,6 +129,24 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         is UiState.Error -> ErrorScreen(
             message = s.message,
             onBack = { vm.backToList() }
+        )
+    }
+
+    // Popup saat memori tidak cukup untuk game yang dipilih
+    storageAlert?.let { alert ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissStorageAlert() },
+            confirmButton = {
+                TextButton(onClick = { vm.dismissStorageAlert() }) { Text("Mengerti") }
+            },
+            title = { Text("Memori penuh") },
+            text = {
+                Text(
+                    "Game ${alert.gameName} butuh sekitar ${formatBytes(alert.neededBytes)} untuk disimpan, " +
+                        "tetapi memori yang tersedia hanya ${formatBytes(alert.freeBytes)}.\n\n" +
+                        "Kosongkan memori dulu, lalu coba lagi."
+                )
+            }
         )
     }
 }
@@ -251,7 +274,13 @@ fun LoginScreen(
 }
 
 @Composable
-fun GameListScreen(games: List<GameInfo>, onSelect: (Int) -> Unit, onOpenDownload: () -> Unit) {
+fun GameListScreen(
+    games: List<GameInfo>,
+    sizes: Map<Int, GameSize>,
+    sizesLoading: Boolean,
+    onSelect: (Int) -> Unit,
+    onOpenDownload: () -> Unit
+) {
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(LibraryFilter.ALL) }
     val installed = remember(games) { installedAppIds() }
@@ -347,12 +376,31 @@ fun GameListScreen(games: List<GameInfo>, onSelect: (Int) -> Unit, onOpenDownloa
                     supportingContent = {
                         Text(if (done) "App ID ${game.appId} · Sudah diunduh" else "App ID ${game.appId} · Dimiliki")
                     },
+                    trailingContent = {
+                        SizeLabel(size = sizes[game.appId], loading = sizesLoading)
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { onSelect(game.appId) }
                 )
                 Divider()
             }
+        }
+    }
+}
+
+/** Ukuran game di sisi kanan daftar: ukuran unduh besar, ukuran di disk kecil di bawahnya. */
+@Composable
+fun SizeLabel(size: GameSize?, loading: Boolean) {
+    Column(horizontalAlignment = Alignment.End) {
+        if (size != null) {
+            Text("Unduh ${formatBytes(size.download)}", style = MaterialTheme.typography.bodyMedium)
+            Text("Disk ${formatBytes(size.disk)}", style = MaterialTheme.typography.labelSmall)
+        } else {
+            Text(
+                if (loading) "Menghitung..." else "—",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }

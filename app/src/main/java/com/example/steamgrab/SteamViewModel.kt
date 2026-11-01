@@ -5,9 +5,14 @@ import android.content.Intent
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 // Batas waktu supaya kalau macet, layar menampilkan langkah yang macet, bukan loading terus.
@@ -16,6 +21,9 @@ private const val LOGIN_TIMEOUT_MS = 180_000L
 private const val GAMES_TIMEOUT_MS = 120_000L
 
 data class GameInfo(val appId: Int, val name: String)
+
+/** Pesan untuk popup memori penuh. Ukuran dalam byte. */
+data class StorageAlert(val gameName: String, val neededBytes: Long, val freeBytes: Long)
 
 sealed class UiState {
     data class LoggedOut(
@@ -47,8 +55,18 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     private val _uiState = MutableStateFlow<UiState>(UiState.LoggedOut())
     val uiState: StateFlow<UiState> = _uiState
 
+    /** Ukuran game yang sudah diketahui (dari penyimpanan atau hasil hitungan). */
+    val sizes: StateFlow<Map<Int, GameSize>> = GameSizeStore.sizes
+
+    private val _sizesLoading = MutableStateFlow(false)
+    val sizesLoading: StateFlow<Boolean> = _sizesLoading.asStateFlow()
+
+    private val _storageAlert = MutableStateFlow<StorageAlert?>(null)
+    val storageAlert: StateFlow<StorageAlert?> = _storageAlert.asStateFlow()
+
     private var ownedGames: List<GameInfo> = emptyList()
     private var watchingAppId: Int? = null
+    private var sizeJob: Job? = null
 
     init {
         // Status download datang dari DownloadService, UI hanya menampilkannya
@@ -94,10 +112,77 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 ownedGames = games
                 watchingAppId = null
                 _uiState.value = UiState.GameList(games)
+                loadSizesInBackground(games)
             } catch (e: Exception) {
                 DebugLog.log("ERROR saat $step: ${e.describe()}")
                 Log.e("SteamGrab", "Gagal saat $step", e)
                 _uiState.value = UiState.LoggedOut(error = "Gagal saat $step.\nDetail:\n${e.describe()}")
+            }
+        }
+    }
+
+    /**
+     * Dipanggil saat game diketuk. Memeriksa ruang penyimpanan dulu.
+     * Kalau tidak cukup, popup memori penuh muncul dan download tidak dimulai.
+     */
+    fun requestDownload(appId: Int) {
+        if (DownloadService.status.value is DownloadStatus.Running) {
+            openRunningDownload()
+            return
+        }
+        val game = ownedGames.find { it.appId == appId } ?: return
+        viewModelScope.launch {
+            val check = withContext(Dispatchers.IO) { checkStorage(appId) }
+            if (check != null && check.first > check.second) {
+                DebugLog.log("Memori tidak cukup untuk ${game.name}")
+                _storageAlert.value = StorageAlert(game.name, check.first, check.second)
+            } else {
+                startDownload(appId)
+            }
+        }
+    }
+
+    fun dismissStorageAlert() {
+        _storageAlert.value = null
+    }
+
+    /**
+     * Mengembalikan (butuh, tersedia) dalam byte. Null kalau ukuran game belum bisa dihitung,
+     * dan download tetap dicoba.
+     */
+    private suspend fun checkStorage(appId: Int): Pair<Long, Long>? {
+        val size = GameSizeStore.get(appId) ?: try {
+            repo.computeDownloadSize(appId).also { GameSizeStore.put(appId, it) }
+        } catch (e: Exception) {
+            DebugLog.log("Ukuran game belum diketahui, download tetap dicoba: ${e.describe()}")
+            return null
+        }
+        val installDir = repo.installDirOf(appId)
+        val existing = if (installDir != null) Storage.existingBytes(installDir) else 0L
+        // Yang perlu disediakan hanya bagian yang belum ada di folder
+        val needed = (size.disk - existing).coerceAtLeast(0L)
+        val free = Storage.freeBytes()
+        DebugLog.log("Cek ruang: butuh ${formatBytes(needed)}, tersedia ${formatBytes(free)}")
+        return needed to free
+    }
+
+    /** Menghitung ukuran semua game di latar belakang, satu per satu. Hasilnya disimpan, jadi tidak dihitung ulang. */
+    private fun loadSizesInBackground(games: List<GameInfo>) {
+        if (sizeJob?.isActive == true) return
+        sizeJob = viewModelScope.launch(Dispatchers.IO) {
+            _sizesLoading.value = true
+            try {
+                for (game in games) {
+                    if (GameSizeStore.get(game.appId) != null) continue
+                    try {
+                        GameSizeStore.put(game.appId, repo.computeDownloadSize(game.appId))
+                    } catch (e: Exception) {
+                        if (!isActive) throw e
+                        DebugLog.log("Ukuran ${game.name} belum bisa dihitung: ${e.describe()}")
+                    }
+                }
+            } finally {
+                _sizesLoading.value = false
             }
         }
     }
