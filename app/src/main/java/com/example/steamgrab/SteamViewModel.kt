@@ -218,6 +218,9 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 for (game in games) {
                     if (GameSizeStore.get(game.appId) != null) continue
+                    // Jangan menghitung ukuran saat download berjalan. Unduh manifest besar ikut memakai
+                    // memori dan jaringan, dan di log terbukti membuatnya timeout.
+                    while (DownloadService.status.value is DownloadStatus.Running) delay(2_000L)
                     try {
                         GameSizeStore.put(game.appId, repo.computeDownloadSize(game.appId))
                     } catch (e: Exception) {

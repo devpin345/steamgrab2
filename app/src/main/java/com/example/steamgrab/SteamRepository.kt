@@ -45,6 +45,12 @@ data class OwnedGame(val appId: Int, val name: String)
 /** DEVICE = kode dari aplikasi authenticator, EMAIL = kode dari email, APPROVAL = menunggu persetujuan di Steam Mobile. */
 enum class GuardType { DEVICE, EMAIL, APPROVAL }
 
+/**
+ * Depot yang dipilih untuk diunduh. [download] (terkompresi) dan [disk] (setelah dibuka) berasal dari info app
+ * Steam dan null kalau info itu tidak memuatnya.
+ */
+data class DepotChoice(val depotId: Int, val manifestId: Long, val download: Long?, val disk: Long?)
+
 /** Keadaan satu depot dari listener library: byte terkompresi, byte tidak terkompresi, dan persennya (0..1). */
 internal class DepotProgress(val compressed: Long, val uncompressed: Long, val percent: Float)
 
@@ -319,8 +325,16 @@ class SteamRepository private constructor(context: Context) {
                 }
             }
 
-            // Argumen: maxDownloads = 50 chunk paralel, maxFileWrites = 20 penulisan file paralel
-            val downloader = DepotDownloader(client, licenses, false, false, 50, 20)
+            // Urutan parameter di JavaSteam 1.8.0: maxDownloads, maxDecompress, maxFileWrites.
+            // Angka sebelumnya (50 dan 20) membuat memori aplikasi habis: tiap thread yang mendekompresi
+            // chunk menyimpan buffer 8 MB sendiri (VZipUtil), sedangkan batas memori aplikasi hanya 256 MB.
+            // Kecepatan tetap dibatasi jaringan, jadi angka kecil sudah cukup.
+            val downloader = DepotDownloader(
+                client, licenses, false, false,
+                maxDownloads = 6,
+                maxDecompress = 2,
+                maxFileWrites = 2
+            )
             try {
                 downloader.addListener(listener)
                 downloader.add(
@@ -361,14 +375,26 @@ class SteamRepository private constructor(context: Context) {
         appInfos[appId]?.let { it["config"]["installdir"].asString() }
 
     /**
-     * Menghitung ukuran game dari manifest tiap depot. Manifest itu kecil, jadi jauh lebih ringan
-     * daripada mengunduh isi game. Pilihan depot sama dengan yang dipakai library saat download.
+     * Menghitung ukuran game. Cara cepat: info app dari Steam biasanya sudah memuat ukuran tiap depot
+     * (manifests/public/download dan size), jadi tidak ada yang perlu diunduh. Kalau ada depot yang
+     * tidak menyertakan ukuran, jatuh ke cara lama: mengunduh manifest depot itu.
+     * Pilihan depot sama dengan yang dipakai library saat download.
      */
     suspend fun computeDownloadSize(appId: Int): GameSize = withContext(Dispatchers.IO) {
         val kv = appInfos[appId] ?: error("Info app $appId belum dimuat")
-        val steamContent = client.getHandler(SteamContent::class.java) ?: error("Sesi Steam belum siap")
         val depots = selectedDepots(kv)
         if (depots.isEmpty()) return@withContext GameSize(0L, 0L)
+
+        if (depots.all { it.download != null && it.disk != null }) {
+            val quick = GameSize(depots.sumOf { it.download ?: 0L }, depots.sumOf { it.disk ?: 0L })
+            DebugLog.log(
+                "Ukuran app $appId dari info app: unduh ${formatBytes(quick.download)}, disk ${formatBytes(quick.disk)}"
+            )
+            return@withContext quick
+        }
+        DebugLog.log("Info app $appId tidak memuat ukuran semua depot, mengunduh manifest")
+
+        val steamContent = client.getHandler(SteamContent::class.java) ?: error("Sesi Steam belum siap")
 
         val server = steamContent.getServersForSteamPipe(
             cellId = client.cellID ?: 0,
@@ -416,7 +442,7 @@ class SteamRepository private constructor(context: Context) {
     }
 
     /** Depot untuk Windows 64-bit bahasa Inggris, beserta ID manifest publiknya. */
-    private fun selectedDepots(kv: KeyValue): List<Pair<Int, Long>> =
+    private fun selectedDepots(kv: KeyValue): List<DepotChoice> =
         kv["depots"].children.mapNotNull { section ->
             val depotId = section.name?.toIntOrNull() ?: return@mapNotNull null
             if (section.children.isEmpty()) return@mapNotNull null
@@ -432,9 +458,15 @@ class SteamRepository private constructor(context: Context) {
                 if (cfg["lowviolence"].asBoolean()) return@mapNotNull null
             }
 
-            val manifestId = section["manifests"]["public"]["gid"].asString()?.toLongOrNull()
+            val manifest = section["manifests"]["public"]
+            val manifestId = manifest["gid"].asString()?.toLongOrNull()
                 ?: return@mapNotNull null
-            depotId to manifestId
+            DepotChoice(
+                depotId = depotId,
+                manifestId = manifestId,
+                download = manifest["download"].asString()?.toLongOrNull(),
+                disk = manifest["size"].asString()?.toLongOrNull()
+            )
         }
 
     // ---- helper ----
