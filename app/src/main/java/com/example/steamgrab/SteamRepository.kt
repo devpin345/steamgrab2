@@ -54,6 +54,9 @@ class SteamRepository private constructor(context: Context) {
 
     private val prefs = context.getSharedPreferences("steam_session", Context.MODE_PRIVATE)
     private val client = SteamClient()
+    // Klien CDN untuk menghitung ukuran. JANGAN di-close: Client.close() mematikan executor HTTP yang
+    // dipakai bersama oleh semua klien CDN di sesi ini, sehingga download berikutnya gagal dengan "executor rejected".
+    private val sizeCdn: CdnClient by lazy { CdnClient(client) }
     private val manager = CallbackManager(client)
     // Error yang tidak tertangkap di coroutine latar belakang dicatat, bukan membuat aplikasi tertutup
     private val scope = CoroutineScope(
@@ -343,44 +346,40 @@ class SteamRepository private constructor(context: Context) {
             .minByOrNull { it.weightedLoad }
             ?: error("Tidak ada server CDN yang tersedia")
 
-        val cdn = CdnClient(client)
-        try {
-            var download = 0L
-            var disk = 0L
-            for ((depotId, manifestId) in depots) {
-                val code = steamContent
-                    .getManifestRequestCode(depotId, appId, manifestId, "public", null, this)
-                    .await()
-                if (code == 0L) error("Steam tidak memberi izin untuk manifest depot $depotId")
+        val cdn = sizeCdn
+        var download = 0L
+        var disk = 0L
+        for ((depotId, manifestId) in depots) {
+            // Kode 0 bukan error. Library juga memakai URL tanpa kode dalam kasus itu.
+            val code = steamContent
+                .getManifestRequestCode(depotId, appId, manifestId, "public", null, this)
+                .await()
 
-                // Coba tanpa token dulu. Token baru diminta kalau server menolak, sama seperti yang dilakukan library.
-                val manifest = try {
-                    cdn.downloadManifest(
-                        depotId = depotId,
-                        manifestId = manifestId,
-                        manifestRequestCode = code.toULong(),
-                        server = server,
-                    )
-                } catch (e: Exception) {
-                    if (!isActive) throw e
-                    DebugLog.log("Manifest depot $depotId ditolak tanpa token, mencoba dengan token: ${e.describe()}")
-                    val auth = steamContent.getCDNAuthToken(appId, depotId, server.host!!, this).await()
-                    if (auth.result != EResult.OK) error("Token CDN depot $depotId ditolak: ${auth.result}")
-                    cdn.downloadManifest(
-                        depotId = depotId,
-                        manifestId = manifestId,
-                        manifestRequestCode = code.toULong(),
-                        server = server,
-                        cdnAuthToken = auth.token,
-                    )
-                }
-                download += manifest.totalCompressedSize
-                disk += manifest.totalUncompressedSize
+            // Coba tanpa token dulu. Token baru diminta kalau server menolak, sama seperti yang dilakukan library.
+            val manifest = try {
+                cdn.downloadManifest(
+                    depotId = depotId,
+                    manifestId = manifestId,
+                    manifestRequestCode = code.toULong(),
+                    server = server,
+                )
+            } catch (e: Exception) {
+                if (!isActive) throw e
+                DebugLog.log("Manifest depot $depotId ditolak tanpa token, mencoba dengan token: ${e.describe()}")
+                val auth = steamContent.getCDNAuthToken(appId, depotId, server.host!!, this).await()
+                if (auth.result != EResult.OK) error("Token CDN depot $depotId ditolak: ${auth.result}")
+                cdn.downloadManifest(
+                    depotId = depotId,
+                    manifestId = manifestId,
+                    manifestRequestCode = code.toULong(),
+                    server = server,
+                    cdnAuthToken = auth.token,
+                )
             }
-            GameSize(download, disk)
-        } finally {
-            cdn.close()
+            download += manifest.totalCompressedSize
+            disk += manifest.totalUncompressedSize
         }
+        GameSize(download, disk)
     }
 
     /** Depot untuk Windows 64-bit bahasa Inggris, beserta ID manifest publiknya. */
