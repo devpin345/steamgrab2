@@ -87,6 +87,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     val state by vm.uiState.collectAsState()
     val sizes by vm.sizes.collectAsState()
     val sizesLoading by vm.sizesLoading.collectAsState()
+    val prices by vm.prices.collectAsState()
     val storageAlert by vm.storageAlert.collectAsState()
 
     // Notifikasi dibutuhkan agar progres download terlihat di Android 13 ke atas
@@ -112,6 +113,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             games = s.games,
             sizes = sizes,
             sizesLoading = sizesLoading,
+            free = prices,
             onSelect = { appId -> vm.requestDownload(appId) },
             onOpenDownload = { vm.openRunningDownload() }
         )
@@ -278,6 +280,7 @@ fun GameListScreen(
     games: List<GameInfo>,
     sizes: Map<Int, GameSize>,
     sizesLoading: Boolean,
+    free: Map<Int, Boolean>,
     onSelect: (Int) -> Unit,
     onOpenDownload: () -> Unit
 ) {
@@ -374,7 +377,13 @@ fun GameListScreen(
                     leadingContent = { GameHeader(appId = game.appId, modifier = Modifier.width(96.dp)) },
                     headlineContent = { Text(game.name) },
                     supportingContent = {
-                        Text(if (done) "App ID ${game.appId} · Sudah diunduh" else "App ID ${game.appId} · Dimiliki")
+                        val priceLabel = when (free[game.appId]) {
+                            true -> "Gratis"
+                            false -> "Berbayar"
+                            null -> null
+                        }
+                        val ownLabel = if (done) "Sudah diunduh" else "Dimiliki"
+                        Text(listOfNotNull("App ID ${game.appId}", priceLabel, ownLabel).joinToString(" · "))
                     },
                     trailingContent = {
                         SizeLabel(size = sizes[game.appId], loading = sizesLoading)

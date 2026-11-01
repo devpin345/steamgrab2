@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,6 +59,9 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     /** Ukuran game yang sudah diketahui (dari penyimpanan atau hasil hitungan). */
     val sizes: StateFlow<Map<Int, GameSize>> = GameSizeStore.sizes
 
+    /** Status gratis per game (true = gratis). Game yang belum diketahui tidak ada di map ini. */
+    val prices: StateFlow<Map<Int, Boolean>> = GamePriceStore.prices
+
     private val _sizesLoading = MutableStateFlow(false)
     val sizesLoading: StateFlow<Boolean> = _sizesLoading.asStateFlow()
 
@@ -68,8 +72,10 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     private var watchingAppId: Int? = null
     private var sizeJob: Job? = null
     private var loginJob: Job? = null
+    private var priceJob: Job? = null
 
     init {
+        GamePriceStore.init(app)
         // Status download datang dari DownloadService, UI hanya menampilkannya
         viewModelScope.launch {
             DownloadService.status.collect { onDownloadStatus(it) }
@@ -141,6 +147,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 watchingAppId = null
                 _uiState.value = UiState.GameList(games)
                 loadSizesInBackground(games)
+                loadPricesInBackground(games)
             } catch (e: Exception) {
                 DebugLog.log("ERROR saat $step: ${e.describe()}")
                 Log.e("SteamGrab", "Gagal saat $step", e)
@@ -211,6 +218,26 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 _sizesLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Mengambil status gratis dari Steam Store satu per satu. Ada jeda antar permintaan
+     * supaya tidak kena batas permintaan Steam. Yang sudah diketahui tidak diambil lagi.
+     */
+    private fun loadPricesInBackground(games: List<GameInfo>) {
+        if (priceJob?.isActive == true) return
+        priceJob = viewModelScope.launch(Dispatchers.IO) {
+            for (game in games) {
+                if (GamePriceStore.get(game.appId) != null) continue
+                try {
+                    StorePrices.isFree(game.appId)?.let { GamePriceStore.put(game.appId, it) }
+                } catch (e: Exception) {
+                    if (!isActive) throw e
+                    DebugLog.log("Status gratis ${game.name} belum diketahui: ${e.describe()}")
+                }
+                delay(1_500L)
             }
         }
     }
