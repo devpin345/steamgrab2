@@ -8,6 +8,8 @@ import `in`.dragonbra.javasteam.depotdownloader.data.DownloadItem
 import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.authentication.AuthSessionDetails
 import `in`.dragonbra.javasteam.steam.authentication.IAuthenticator
+import `in`.dragonbra.javasteam.steam.authentication.CredentialsAuthSession
+import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesAuthSteamclient.EAuthSessionGuardType
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.License
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.PICSProductInfo
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.PICSRequest
@@ -40,7 +42,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 data class OwnedGame(val appId: Int, val name: String)
 
-enum class GuardType { DEVICE, EMAIL }
+/** DEVICE = kode dari aplikasi authenticator, EMAIL = kode dari email, APPROVAL = menunggu persetujuan di Steam Mobile. */
+enum class GuardType { DEVICE, EMAIL, APPROVAL }
 
 /** Keadaan satu depot dari listener library: byte terkompresi, byte tidak terkompresi, dan persennya (0..1). */
 internal class DepotProgress(val compressed: Long, val uncompressed: Long, val percent: Float)
@@ -78,6 +81,9 @@ class SteamRepository private constructor(context: Context) {
     private var pendingPass: String? = null
     private var onGuardNeeded: ((GuardType, Boolean) -> Unit)? = null
     @Volatile private var pendingGuard: CompletableFuture<String>? = null
+    // Sesi login yang sedang menunggu persetujuan di Steam Mobile. Kode juga bisa dikirim langsung ke sesi ini.
+    @Volatile private var activeSession: CredentialsAuthSession? = null
+    @Volatile private var awaitingApproval = false
     @Volatile private var connected = false
     private var pumpStarted = false
     // Dikirim ke UI saat status koneksi berubah (misalnya sedang menyambung ulang saat menunggu kode)
@@ -100,6 +106,8 @@ class SteamRepository private constructor(context: Context) {
                 // Kode yang sedang ditunggu ikut batal. Setelah tersambung, Steam akan meminta kode lagi.
                 pendingGuard?.cancel(false)
                 pendingGuard = null
+                awaitingApproval = false
+                activeSession = null
                 onStatus?.invoke("Koneksi ke Steam terputus, menyambung ulang...")
                 scope.launch {
                     delay(2000L)
@@ -165,16 +173,41 @@ class SteamRepository private constructor(context: Context) {
 
     /** True jika library sedang menunggu kode Steam Guard dari pengguna. */
     val isWaitingForGuard: Boolean
-        get() = pendingGuard != null
+        get() = pendingGuard != null || awaitingApproval
 
     /** Mengembalikan true jika kode dipakai untuk pertanyaan Steam Guard yang sedang menunggu. */
     fun submitGuardCode(code: String?): Boolean {
-        val future = pendingGuard ?: return false
         if (code.isNullOrBlank()) return false
-        pendingGuard = null
-        DebugLog.log("Kode Steam Guard diteruskan ke library")
-        future.complete(code.trim())
-        return true
+
+        val future = pendingGuard
+        if (future != null) {
+            pendingGuard = null
+            DebugLog.log("Kode Steam Guard diteruskan ke library")
+            future.complete(code.trim())
+            return true
+        }
+
+        val session = activeSession
+        if (awaitingApproval && session != null) {
+            // Sesi masih menunggu persetujuan di Steam Mobile. Kode dikirim langsung ke sesi itu,
+            // bukan memulai login baru (login baru akan memunculkan permintaan baru di Steam Mobile).
+            DebugLog.log("Kode Steam Guard dikirim ke sesi yang menunggu persetujuan")
+            scope.launch {
+                try {
+                    session.sendSteamGuardCode(
+                        code.trim(),
+                        EAuthSessionGuardType.k_EAuthSessionGuardType_DeviceCode,
+                        scope
+                    ).get()
+                    DebugLog.log("Kode diterima Steam, menunggu hasil login")
+                } catch (e: Exception) {
+                    DebugLog.log("Kode ditolak Steam: ${e.describe()}")
+                    if (!e.isConnectionLoss()) onGuardNeeded?.invoke(GuardType.DEVICE, true)
+                }
+            }
+            return true
+        }
+        return false
     }
 
     /** Daftar game yang dimiliki akun, nama diambil dari info app Steam. */
@@ -494,9 +527,15 @@ class SteamRepository private constructor(context: Context) {
                 DebugLog.log("Mengirim login kredensial ke Steam...")
                 val session = client.authentication.beginAuthSessionViaCredentials(details).get()
                 DebugLog.log("Sesi login dibuat, menunggu verifikasi...")
-                val poll = session.pollingWaitForResult().get()
-                DebugLog.log("Verifikasi selesai, token diterima")
-                poll
+                activeSession = session
+                try {
+                    val poll = session.pollingWaitForResult().get()
+                    DebugLog.log("Verifikasi selesai, token diterima")
+                    poll
+                } finally {
+                    awaitingApproval = false
+                    activeSession = null
+                }
             }
 
             prefs.edit()
@@ -538,9 +577,14 @@ class SteamRepository private constructor(context: Context) {
         override fun getEmailCode(email: String?, previousCodeWasIncorrect: Boolean): CompletableFuture<String> =
             askGuardCode(GuardType.EMAIL, previousCodeWasIncorrect)
 
-        // false = tidak memakai konfirmasi di aplikasi Steam Mobile, langsung minta kode manual
-        override fun acceptDeviceConfirmation(): CompletableFuture<Boolean> =
-            CompletableFuture.completedFuture(false)
+        // true = tunggu persetujuan di aplikasi Steam Mobile. Library memantau sendiri sampai disetujui.
+        // Kode tetap bisa dikirim lewat submitGuardCode selama sesi menunggu.
+        override fun acceptDeviceConfirmation(): CompletableFuture<Boolean> {
+            awaitingApproval = true
+            DebugLog.log("Menunggu persetujuan di Steam Mobile")
+            onGuardNeeded?.invoke(GuardType.APPROVAL, false)
+            return CompletableFuture.completedFuture(true)
+        }
     }
 
     private fun askGuardCode(type: GuardType, wrongCode: Boolean): CompletableFuture<String> {

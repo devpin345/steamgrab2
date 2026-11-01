@@ -43,6 +43,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -220,6 +221,7 @@ fun LoginScreen(
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var guardCode by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -238,7 +240,12 @@ fun LoginScreen(
         OutlinedTextField(
             value = password, onValueChange = { password = it },
             label = { Text("Password") },
-            visualTransformation = PasswordVisualTransformation(),
+            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                    EyeIcon(visible = passwordVisible)
+                }
+            },
             modifier = Modifier.fillMaxWidth()
         )
 
@@ -266,11 +273,43 @@ fun LoginScreen(
         }
         Button(
             onClick = { onLogin(username, password, guardCode.ifBlank { null }) },
-            enabled = !loading && username.isNotBlank() && password.isNotBlank(),
+            // Saat menunggu kode, tombol baru aktif setelah kode diisi. Saat menunggu persetujuan di Steam Mobile, tidak wajib.
+            enabled = !loading && username.isNotBlank() && password.isNotBlank() &&
+                (!needsGuardCode || guardCode.isNotBlank()),
             modifier = Modifier.fillMaxWidth()
         ) {
             if (loading) CircularProgressIndicator(modifier = Modifier.size(20.dp))
             else Text(if (needsGuardCode) "Kirim kode" else "Login")
+        }
+    }
+}
+
+/**
+ * Ikon mata untuk tombol lihat/sembunyikan password. Digambar sendiri karena
+ * ikon extended tidak dipakai di proyek ini. Mata dicoret kalau password sedang disembunyikan.
+ */
+@Composable
+fun EyeIcon(visible: Boolean, modifier: Modifier = Modifier) {
+    val color = LocalContentColor.current
+    Canvas(modifier.size(24.dp)) {
+        val w = size.width
+        val h = size.height
+        val eye = Path().apply {
+            moveTo(w * 0.05f, h * 0.5f)
+            quadraticBezierTo(w * 0.5f, h * -0.15f, w * 0.95f, h * 0.5f)
+            quadraticBezierTo(w * 0.5f, h * 1.15f, w * 0.05f, h * 0.5f)
+            close()
+        }
+        drawPath(eye, color, style = Stroke(width = w * 0.08f, join = StrokeJoin.Round))
+        drawCircle(color, radius = w * 0.14f, center = Offset(w * 0.5f, h * 0.5f))
+        if (!visible) {
+            drawLine(
+                color,
+                start = Offset(w * 0.1f, h * 0.9f),
+                end = Offset(w * 0.9f, h * 0.1f),
+                strokeWidth = w * 0.08f,
+                cap = StrokeCap.Round
+            )
         }
     }
 }

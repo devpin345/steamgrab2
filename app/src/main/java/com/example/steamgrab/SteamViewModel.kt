@@ -116,12 +116,21 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                         username = username.trim(),
                         password = password,
                         onGuardCodeNeeded = { type, wrongCode ->
-                            val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
-                            _uiState.value = UiState.LoggedOut(
-                                loading = false,
-                                needsGuardCode = true,
-                                error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
-                            )
+                            _uiState.value = if (type == GuardType.APPROVAL) {
+                                // Belum ada yang salah: cukup setujui di Steam Mobile. Kode juga bisa diketik.
+                                UiState.LoggedOut(
+                                    loading = false,
+                                    needsGuardCode = true,
+                                    status = "Setujui login di aplikasi Steam Mobile, atau ketik kode Steam Guard lalu tekan Kirim kode."
+                                )
+                            } else {
+                                val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
+                                UiState.LoggedOut(
+                                    loading = false,
+                                    needsGuardCode = true,
+                                    error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
+                                )
+                            }
                         },
                         onStatus = { message ->
                             // Hanya di layar login. Kolom kode tetap tampil supaya kode bisa diketik lagi
