@@ -116,7 +116,8 @@ class DownloadService : Service() {
             val ticker = launch {
                 while (isActive) {
                     delay(TICK_MS)
-                    meter.sample(latest.doneBytes, System.currentTimeMillis())
+                    // runBytes, bukan doneBytes: doneBytes ikut menghitung sesi sebelumnya dan bisa melompat
+                    meter.sample(latest.runBytes, System.currentTimeMillis())
                     publish(gen)
                 }
             }

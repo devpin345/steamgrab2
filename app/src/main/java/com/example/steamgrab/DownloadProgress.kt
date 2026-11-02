@@ -7,7 +7,8 @@ const val SPEED_HISTORY_SIZE = 60
 
 /**
  * Progres download. Byte dihitung dari yang lewat jaringan (terkompresi).
- * [totalBytes] bernilai 0 kalau total belum diketahui.
+ * [doneBytes] sudah termasuk yang diunduh pada sesi sebelumnya (setelah dijeda atau dibatalkan),
+ * jadi tidak kembali ke nol saat dilanjutkan. [totalBytes] bernilai 0 kalau total belum diketahui.
  */
 data class DownloadProgress(
     val doneBytes: Long = 0L,
@@ -15,6 +16,9 @@ data class DownloadProgress(
     val percent: Float = 0f,
     // Tahap yang sedang dikerjakan library sebelum byte game mulai masuk (manifest, alokasi, validasi)
     val phase: String = "",
+    // Byte yang benar-benar lewat jaringan sejak sesi ini dimulai. Dipakai untuk menghitung kecepatan,
+    // karena doneBytes bisa melompat saat sesi sebelumnya dihitung masuk.
+    val runBytes: Long = 0L,
 )
 
 /** Menghitung kecepatan per detik dari selisih byte, dan menyimpan riwayatnya untuk grafik. */

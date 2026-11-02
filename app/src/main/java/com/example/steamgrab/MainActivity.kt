@@ -34,6 +34,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -371,6 +374,8 @@ fun GameListScreen(
     var filter by remember { mutableStateOf(LibraryFilter.ALL) }
     val installed = remember(games) { installedAppIds() }
     val partial = remember(games) { partialAppIds() }
+    // Game yang diketuk padahal sudah selesai diunduh: dikenali, tidak langsung diunduh ulang
+    var knownDone by remember { mutableStateOf<GameInfo?>(null) }
     val running by DownloadService.status.collectAsState()
 
     val shown = games.filter { game ->
@@ -380,6 +385,26 @@ fun GameListScreen(
                 LibraryFilter.INSTALLED -> game.appId in installed
                 LibraryFilter.NOT_INSTALLED -> game.appId !in installed
             }
+    }
+
+    knownDone?.let { game ->
+        AlertDialog(
+            onDismissRequest = { knownDone = null },
+            title = { Text(game.name) },
+            text = {
+                Text(
+                    "Game ini sudah selesai diunduh dan tersimpan di Download/SteamGames/steamapps/common. " +
+                        "Tidak perlu diunduh lagi. Pilih Periksa ulang kalau ingin memastikan semua filenya lengkap."
+                )
+            },
+            confirmButton = { TextButton(onClick = { knownDone = null }) { Text("Tutup") } },
+            dismissButton = {
+                TextButton(onClick = {
+                    knownDone = null
+                    onSelect(game.appId)
+                }) { Text("Periksa ulang") }
+            }
+        )
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
@@ -460,7 +485,9 @@ fun GameListScreen(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onSelect(game.appId) }
+                        .clickable {
+                            if (done) knownDone = game else onSelect(game.appId)
+                        }
                 )
                 Divider()
             }
@@ -520,7 +547,6 @@ fun DownloadScreen(
     val p = state.progress
     val pct = (p.percent * 100).toInt().coerceIn(0, 100)
     val known = p.totalBytes > 0L
-    val barColor = MaterialTheme.colorScheme.primary
 
     // Baris keterangan: saat dijeda, saat ukuran sudah diketahui, atau tahap yang sedang berjalan
     val statusLine = when {
@@ -529,105 +555,129 @@ fun DownloadScreen(
         else -> p.phase.ifBlank { "Menyiapkan download..." }
     }
 
-    Column(Modifier.fillMaxSize().padding(20.dp)) {
-        GameHeader(appId = state.appId, modifier = Modifier.width(220.dp))
-        Spacer(Modifier.height(12.dp))
-        Text(
-            state.gameName,
-            style = MaterialTheme.typography.headlineSmall,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(statusLine, style = MaterialTheme.typography.bodyMedium)
-        Spacer(Modifier.height(16.dp))
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        // Gambar latar game tanpa judul, dengan candle kecepatan di atasnya
+        DownloadBackdrop(appId = state.appId, speedSamples = state.speedHistory)
 
-        Row(Modifier.fillMaxWidth().height(220.dp)) {
-            // Kiri: bar persentase
-            Column(
-                modifier = Modifier.width(72.dp).fillMaxHeight(),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text("$pct%", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(8.dp))
-                Box(
-                    modifier = Modifier
-                        .width(36.dp)
-                        .weight(1f)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .fillMaxHeight(p.percent.coerceIn(0f, 1f))
-                            .background(barColor)
+        // Bar progres tipis tepat di bawah gambar
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(4.dp)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Box(
+                Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(p.percent.coerceIn(0f, 1f))
+                    .background(MaterialTheme.colorScheme.primary)
+            )
+        }
+
+        Column(Modifier.fillMaxWidth().padding(20.dp)) {
+            Text(
+                state.gameName,
+                style = MaterialTheme.typography.headlineSmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text("$pct%", style = MaterialTheme.typography.headlineMedium)
+                if (!state.paused) {
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        formatSpeed(state.speedBps),
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(bottom = 3.dp)
                     )
                 }
             }
-
-            Spacer(Modifier.width(16.dp))
-
-            // Kanan: kecepatan per detik dengan grafiknya
-            Column(Modifier.weight(1f).fillMaxHeight()) {
-                Text("Kecepatan", style = MaterialTheme.typography.labelMedium)
-                Text(formatSpeed(state.speedBps), style = MaterialTheme.typography.headlineSmall)
-                Spacer(Modifier.height(8.dp))
-                SpeedGraph(samples = state.speedHistory, modifier = Modifier.fillMaxWidth().weight(1f))
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-        if (!state.paused) {
-            Text(
-                "Download tetap berjalan walau layar dikunci atau aplikasi ditutup. Pantau dari notifikasi.",
-                style = MaterialTheme.typography.bodySmall
-            )
+            Spacer(Modifier.height(4.dp))
+            Text(statusLine, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(16.dp))
-        }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (state.paused) {
-                Button(onClick = { onResume(state.appId) }) { Text("Lanjutkan") }
-            } else {
-                Button(onClick = onPause) { Text("Jeda") }
+            if (!state.paused) {
+                Text(
+                    "Download tetap berjalan walau layar dikunci atau aplikasi ditutup. Pantau dari notifikasi.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(16.dp))
             }
-            OutlinedButton(onClick = onCancel) { Text("Batal") }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (state.paused) {
+                    Button(onClick = { onResume(state.appId) }) { Text("Lanjutkan") }
+                } else {
+                    Button(onClick = onPause) { Text("Jeda") }
+                }
+                OutlinedButton(onClick = onCancel) { Text("Batal") }
+            }
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onBack) { Text("Ke daftar game") }
         }
-        Spacer(Modifier.height(8.dp))
-        TextButton(onClick = onBack) { Text("Ke daftar game") }
     }
 }
 
-/** Grafik kecepatan: garis dari kanan (terbaru) ke kiri, skala mengikuti nilai tertinggi. */
+/**
+ * Gambar latar game (tanpa judul) dengan candle kecepatan di bagian bawahnya. Selama gambar belum siap
+ * atau game tidak punya gambar latar, yang tampil warna polos.
+ */
 @Composable
-fun SpeedGraph(samples: List<Long>, modifier: Modifier = Modifier) {
-    val lineColor = MaterialTheme.colorScheme.primary
-    val baseColor = MaterialTheme.colorScheme.outlineVariant
+private fun DownloadBackdrop(appId: Int, speedSamples: List<Long>) {
+    val hero by produceState<Bitmap?>(initialValue = GameImages.cachedHero(appId), key1 = appId) {
+        value = GameImages.loadHero(appId)
+    }
 
-    Canvas(modifier = modifier) {
-        drawLine(
-            color = baseColor,
-            start = Offset(0f, size.height),
-            end = Offset(size.width, size.height),
-            strokeWidth = 1.dp.toPx()
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(240.dp)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        val b = hero
+        if (b != null) {
+            Image(
+                bitmap = b.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.matchParentSize()
+            )
+        }
+        // Bayangan tipis di bagian bawah supaya candle tetap terbaca di gambar yang terang
+        Box(
+            Modifier
+                .matchParentSize()
+                .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.35f))))
         )
-        if (samples.size < 2) return@Canvas
+        SpeedCandles(
+            samples = speedSamples,
+            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(110.dp)
+        )
+    }
+}
+
+/**
+ * Candle kecepatan: satu batang per detik, terbaru di kanan. Jarak antar batang sama dengan lebar batang,
+ * jadi bentuknya "l l l", bukan "lll". Putih dengan opasitas 45%, skala mengikuti nilai tertinggi.
+ */
+@Composable
+fun SpeedCandles(samples: List<Long>, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        if (samples.isEmpty()) return@Canvas
 
         val peak = (samples.maxOrNull() ?: 0L).coerceAtLeast(1L).toFloat()
-        val stepX = size.width / (SPEED_HISTORY_SIZE - 1)
-        val path = Path()
+        // Batang dan celah sama lebar: 60 batang dan 59 celah berarti 119 satuan lebar
+        val unit = size.width / (2 * SPEED_HISTORY_SIZE - 1)
+        val minHeight = 2.dp.toPx()
+        val color = Color.White.copy(alpha = 0.45f)
+        val firstSlot = SPEED_HISTORY_SIZE - samples.size
+
         samples.forEachIndexed { i, v ->
-            val x = size.width - (samples.size - 1 - i) * stepX
-            val y = size.height - (v / peak) * size.height
-            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            val h = (v / peak * size.height).coerceAtLeast(minHeight)
+            val x = (firstSlot + i) * 2 * unit
+            drawRect(color = color, topLeft = Offset(x, size.height - h), size = Size(unit, h))
         }
-        drawPath(
-            path = path,
-            color = lineColor,
-            style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
-        )
     }
 }
 
@@ -642,9 +692,11 @@ fun DoneScreen(path: String, onBack: () -> Unit) {
         Text("Tersimpan di:\n$path")
         Spacer(Modifier.height(16.dp))
         Text(
-            "Hubungkan HP ke PC via USB. Salin isi folder steamapps (di Download/SteamGames/steamapps) " +
-                "ke folder steamapps Steam di PC. Gabungkan dengan yang sudah ada, jangan menimpa seluruh folder. " +
-                "Lalu buka Steam dan pilih Verify integrity pada game tersebut."
+            "Hubungkan HP ke PC via USB dan salin folder SteamGames (di Download) ke PC. " +
+                "Di Steam, buka Settings > Storage lalu tambahkan folder itu sebagai library. " +
+                "Atau salin isi folder steamapps ke folder steamapps Steam yang sudah ada, " +
+                "gabungkan dan jangan menimpa seluruh folder. " +
+                "Kalau Steam masih menawarkan pembaruan, pilih Verify integrity pada game tersebut."
         )
         Spacer(Modifier.height(16.dp))
         Button(onClick = onBack) { Text("Download game lain") }

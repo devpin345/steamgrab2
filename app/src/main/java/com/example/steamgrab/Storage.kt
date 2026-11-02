@@ -77,6 +77,22 @@ object Storage {
         return result
     }
 
+    private val bytesDownloadedRegex = Regex("\"BytesDownloaded\"\\s+\"(\\d+)\"")
+
+    /**
+     * Byte (terkompresi) yang sudah diunduh pada sesi sebelumnya, menurut appmanifest. Game yang sudah selesai
+     * dihitung penuh ([totalDownload]). Hasilnya 0 kalau belum ada appmanifest atau tidak terbaca.
+     * Ini dipakai untuk melanjutkan progres dan menghitung sisa ruang yang dibutuhkan.
+     */
+    fun downloadedBefore(appId: Int, totalDownload: Long): Long {
+        val file = manifestFile(appId)
+        val text = runCatching { if (file.exists()) file.readText() else null }.getOrNull() ?: return 0L
+        val flags = stateFlagsRegex.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: return 0L
+        if (isComplete(flags)) return totalDownload
+        val saved = bytesDownloadedRegex.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+        return if (totalDownload > 0L) saved.coerceIn(0L, totalDownload) else saved.coerceAtLeast(0L)
+    }
+
     /** Terinstal penuh: ada bit "installed" dan tidak ada bit update yang tersisa. */
     fun isComplete(flags: Int): Boolean =
         (flags and STATE_INSTALLED) != 0 &&

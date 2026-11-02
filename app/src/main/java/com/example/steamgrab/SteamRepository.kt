@@ -41,6 +41,7 @@ import `in`.dragonbra.javasteam.steam.cdn.Client as CdnClient
 import `in`.dragonbra.javasteam.steam.handlers.steamcontent.SteamContent
 import `in`.dragonbra.javasteam.steam.steamclient.AsyncJobFailedException
 import `in`.dragonbra.javasteam.types.KeyValue
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 data class OwnedGame(val appId: Int, val name: String)
@@ -342,19 +343,45 @@ class SteamRepository private constructor(context: Context) {
         withContext(Dispatchers.IO) {
             DebugLog.log("Download game $appId dimulai")
             val depots = ConcurrentHashMap<Int, DepotProgress>()
-            // Byte yang sudah masuk per depot, dalam bentuk yang dipakai appmanifest
+            // Byte yang sudah masuk per depot pada sesi ini, dalam bentuk yang dipakai appmanifest
             val snapshot = { depots.mapValues { it.value.compressed to it.value.uncompressed } }
+
+            // Yang sudah diunduh pada sesi sebelumnya (dijeda atau dibatalkan) dibaca dari appmanifest sebelum
+            // appmanifest ditulis ulang di bawah. Library memakai ulang file yang sudah valid, jadi hitungan
+            // kita harus ikut melanjutkan dari situ, bukan mulai dari nol.
+            val prior = Storage.downloadedBefore(appId, GameSizeStore.get(appId)?.download ?: 0L)
+            // Ukuran tiap depot (tidak terkompresi) dari info app, untuk membobot persen dari library
+            val depotDisk: Map<Int, Long> = appInfos[appId]
+                ?.let { kv -> selectedDepots(kv).mapNotNull { d -> d.disk?.let { d.depotId to it } }.toMap() }
+                ?: emptyMap()
+            // Progres tertinggi yang pernah ditampilkan. Tidak pernah mundur.
+            val lastDone = AtomicLong(prior)
 
             // Library dan appmanifest ditulis sejak awal. Selama download belum selesai, StateFlags bernilai
             // "belum selesai", jadi Steam di PC tahu game ini belum lengkap dan tidak menganggapnya terinstal.
             runCatching {
                 Storage.ensureLibrary()
-                writeAppManifest(appId, emptyMap(), complete = false)
+                writeAppManifest(appId, emptyMap(), complete = false, downloaded = prior)
             }.onFailure { DebugLog.log("Gagal menulis appmanifest awal: ${it.describe()}") }
             val failure = AtomicReference<Throwable?>(null)
             // Tahap yang sedang dikerjakan library sebelum chunk pertama masuk (manifest, alokasi, validasi)
             val phase = AtomicReference("Menyiapkan download...")
             val category = AtomicReference("")
+
+            val reportProgress = {
+                val raw = summarize(depots, phase.get(), GameSizeStore.get(appId)?.download, prior, depotDisk)
+                // Persen dari library baru lengkap setelah semua file selesai diperiksa, jadi angkanya bisa
+                // turun sesaat. Yang ditampilkan hanya boleh naik.
+                val done = lastDone.accumulateAndGet(raw.doneBytes) { a, b -> if (a > b) a else b }
+                val percent = if (raw.totalBytes > 0L) {
+                    (done.toDouble() / raw.totalBytes).toFloat().coerceIn(0f, 1f)
+                } else {
+                    raw.percent
+                }
+                onProgress(raw.copy(doneBytes = done, percent = percent))
+            }
+            // Tampilkan hasil sesi sebelumnya segera, sebelum library selesai memeriksa file yang ada
+            reportProgress()
 
             val listener = object : IDownloadListener {
                 override fun onStatusUpdate(message: String) {
@@ -379,7 +406,7 @@ class SteamRepository private constructor(context: Context) {
                     uncompressedBytes: Long
                 ) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, depotPercentComplete)
-                    onProgress(summarize(depots, phase.get(), GameSizeStore.get(appId)?.download))
+                    reportProgress()
                 }
 
                 override fun onFileCompleted(depotId: Int, fileName: String, depotPercentComplete: Float) {
@@ -390,13 +417,13 @@ class SteamRepository private constructor(context: Context) {
                         prev?.uncompressed ?: 0L,
                         depotPercentComplete
                     )
-                    onProgress(summarize(depots, phase.get(), GameSizeStore.get(appId)?.download))
+                    reportProgress()
                 }
 
                 override fun onDepotCompleted(depotId: Int, compressedBytes: Long, uncompressedBytes: Long) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, 1f)
                     DebugLog.log("Depot $depotId selesai (${formatBytes(compressedBytes)})")
-                    onProgress(summarize(depots, phase.get(), GameSizeStore.get(appId)?.download))
+                    reportProgress()
                 }
 
                 override fun onDownloadFailed(item: DownloadItem, error: Throwable) {
@@ -447,7 +474,7 @@ class SteamRepository private constructor(context: Context) {
                 Storage.gameDir(installDir)
             } catch (e: Throwable) {
                 // Dijeda, dibatalkan, atau gagal: manifest tetap bertanda belum selesai, dengan jumlah byte yang sudah masuk
-                runCatching { writeAppManifest(appId, snapshot(), complete = false) }
+                runCatching { writeAppManifest(appId, snapshot(), complete = false, downloaded = lastDone.get()) }
                 throw e
             } finally {
                 downloader.close()
@@ -559,21 +586,45 @@ class SteamRepository private constructor(context: Context) {
      * Menggabungkan progres semua depot. Total diperkirakan dari persen tiap depot,
      * jadi masih perkiraan sampai ukuran dari manifest tersedia.
      */
-    private fun summarize(depots: Map<Int, DepotProgress>, phase: String, knownTotal: Long?): DownloadProgress {
-        var done = 0.0
+    private fun summarize(
+        depots: Map<Int, DepotProgress>,
+        phase: String,
+        knownTotal: Long?,
+        prior: Long,
+        depotDisk: Map<Int, Long>,
+    ): DownloadProgress {
+        var thisRun = 0.0
         var total = 0.0
         for (d in depots.values) {
-            done += d.compressed
+            thisRun += d.compressed
             if (d.percent > 0f) total += d.compressed / d.percent.toDouble()
         }
         // Kalau ukuran dari manifest sudah diketahui, pakai itu. Lebih akurat daripada perkiraan dari persen.
         if (knownTotal != null && knownTotal > 0L) total = knownTotal.toDouble()
+
+        // Sesi sebelumnya ditambah yang masuk sekarang. Library hanya mengunduh chunk yang belum ada,
+        // jadi byte yang dilaporkannya hanya dari sesi ini.
+        var done = prior + thisRun
+
+        // Persen dari library ikut menghitung data yang sudah ada di folder. Kalau lebih besar (misalnya
+        // folder berisi data dari sebelum ada catatan di appmanifest), pakai itu.
+        val diskTotal = depotDisk.values.sum()
+        if (diskTotal > 0L && total > 0.0) {
+            var fromLibrary = 0.0
+            for ((depotId, disk) in depotDisk) {
+                fromLibrary += (depots[depotId]?.percent ?: 0f).coerceIn(0f, 1f) * disk.toDouble()
+            }
+            done = maxOf(done, fromLibrary / diskTotal * total)
+        }
+        if (total > 0.0) done = minOf(done, total)
+
         val percent = if (total > 0.0) (done / total).toFloat().coerceIn(0f, 1f) else 0f
         return DownloadProgress(
             doneBytes = done.toLong(),
             totalBytes = total.toLong(),
             percent = percent,
-            phase = phase
+            phase = phase,
+            runBytes = thisRun.toLong()
         )
     }
 
@@ -726,22 +777,37 @@ class SteamRepository private constructor(context: Context) {
      * Menulis appmanifest dengan susunan seperti yang dibuat Steam di PC. [complete] = true menandai game
      * terinstal penuh (StateFlags 4). Kalau false, game ditandai belum selesai (1026) beserta jumlah byte yang
      * sudah masuk, supaya Steam di PC tahu harus melanjutkan dan tidak menganggap game ini lengkap.
-     * [depots] berisi (byte terkompresi, byte tidak terkompresi) yang sudah masuk per depot.
+     * [depots] berisi (byte terkompresi, byte tidak terkompresi) yang masuk per depot pada sesi ini saja.
+     * [downloaded] adalah total byte terkompresi yang sudah masuk termasuk sesi sebelumnya (untuk game belum selesai).
      */
     private fun writeAppManifest(
         appId: Int,
         depots: Map<Int, Pair<Long, Long>>,
         complete: Boolean,
         kv: KeyValue? = appInfos[appId],
+        downloaded: Long? = null,
     ) {
         if (kv == null) return
         val installDir = kv["config"]["installdir"].asString() ?: return
         val name = kv["common"]["name"].asString() ?: "App $appId"
         val buildId = kv["depots"]["branches"]["public"]["buildid"].asString() ?: "0"
-        val doneCompressed = depots.values.sumOf { it.first }
-        val doneUncompressed = depots.values.sumOf { it.second }
         val total = GameSizeStore.get(appId)
-        // Kalau sudah selesai, yang sudah masuk itulah totalnya. Kalau belum, pakai ukuran penuh game.
+        val runCompressed = depots.values.sumOf { it.first }
+        val runUncompressed = depots.values.sumOf { it.second }
+
+        // Sesi yang dilanjutkan hanya melaporkan chunk yang baru diunduh, jadi untuk game yang sudah selesai
+        // ukuran penuh dari manifest yang dipakai, bukan jumlah sesi terakhir.
+        val doneCompressed = if (complete) (total?.download ?: runCompressed) else (downloaded ?: runCompressed)
+        val fraction = if (total != null && total.download > 0L) {
+            (doneCompressed.toDouble() / total.download).coerceIn(0.0, 1.0)
+        } else {
+            0.0
+        }
+        val doneUncompressed = when {
+            complete -> total?.disk ?: runUncompressed
+            total != null -> (total.disk * fraction).toLong()
+            else -> runUncompressed
+        }
         val toDownload = if (complete) doneCompressed else (total?.download ?: 0L)
         val toStage = if (complete) doneUncompressed else (total?.disk ?: 0L)
         val owner = client.steamID?.convertToUInt64() ?: 0L
@@ -778,7 +844,10 @@ class SteamRepository private constructor(context: Context) {
                     val manifestId = kv["depots"][depotId.toString()]["manifests"]["public"]["gid"].asString() ?: "0"
                     append("\t\t\"$depotId\"\n\t\t{\n")
                     append("\t\t\t\"manifest\"\t\t\"$manifestId\"\n")
-                    append("\t\t\t\"size\"\t\t\"${sizes.second}\"\n")
+                    // Ukuran depot penuh dari info app. Jumlah dari sesi terakhir saja terlalu kecil setelah resume.
+                    val depotSize = kv["depots"][depotId.toString()]["manifests"]["public"]["size"]
+                        .asString()?.toLongOrNull() ?: sizes.second
+                    append("\t\t\t\"size\"\t\t\"$depotSize\"\n")
                     append("\t\t}\n")
                 }
                 append("\t}\n")

@@ -201,10 +201,13 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             DebugLog.log("Ukuran game belum diketahui, download tetap dicoba: ${e.describe()}")
             return null
         }
-        // Selalu pakai ukuran penuh. Library mengalokasikan panjang file di awal sebelum datanya tiba,
-        // jadi ukuran file di folder tidak menunjukkan berapa yang sudah benar-benar terunduh.
-        // Mengurangi ukuran itu membuat kebutuhan terhitung 0 B pada percobaan kedua.
-        val needed = size.disk
+        // Library mengalokasikan panjang file di awal sebelum datanya tiba, jadi ukuran file di folder tidak
+        // menunjukkan berapa yang sudah benar-benar terunduh (itu yang dulu membuat kebutuhan terhitung 0 B).
+        // Yang dipakai adalah catatan byte terunduh di appmanifest. Game yang sudah selesai butuh 0 B tambahan,
+        // game yang dijeda di 70% hanya butuh sisanya, bukan ukuran penuh lagi.
+        val before = Storage.downloadedBefore(appId, size.download)
+        val fraction = if (size.download > 0L) (before.toDouble() / size.download).coerceIn(0.0, 1.0) else 0.0
+        val needed = (size.disk * (1.0 - fraction)).toLong()
         val free = Storage.freeBytes()
         DebugLog.log("Cek ruang: butuh ${formatBytes(needed)}, tersedia ${formatBytes(free)}")
         return needed to free
