@@ -176,11 +176,21 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         }
         val game = ownedGames.find { it.appId == appId } ?: return
         viewModelScope.launch {
+            // Catatan kegiatan untuk panel detail di layar download dimulai dari pengecekan ruang
+            DownloadActivity.reset()
+            DownloadActivity.step("Mengecek ruang penyimpanan")
             val check = withContext(Dispatchers.IO) { checkStorage(appId) }
             if (check != null && check.first > check.second) {
                 DebugLog.log("Memori tidak cukup untuk ${game.name}")
                 _storageAlert.value = StorageAlert(game.name, check.first, check.second)
             } else {
+                if (check != null) {
+                    DownloadActivity.step(
+                        "Ruang cukup: butuh ${formatBytes(check.first)}, tersedia ${formatBytes(check.second)}"
+                    )
+                } else {
+                    DownloadActivity.step("Ukuran game belum diketahui, download tetap dimulai")
+                }
                 startDownload(appId)
             }
         }
@@ -196,6 +206,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun checkStorage(appId: Int): Pair<Long, Long>? {
         val size = GameSizeStore.get(appId) ?: try {
+            DownloadActivity.step("Menghitung ukuran game dari info Steam")
             repo.computeDownloadSize(appId).also { GameSizeStore.put(appId, it) }
         } catch (e: Exception) {
             DebugLog.log("Ukuran game belum diketahui, download tetap dicoba: ${e.describe()}")
@@ -301,6 +312,8 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     /** Melanjutkan download yang dijeda. File yang sudah ada dicek ulang, lalu hanya bagian yang belum ada diunduh. */
     fun resumeDownload(appId: Int) {
         DebugLog.log("Tombol Lanjutkan ditekan")
+        DownloadActivity.reset()
+        DownloadActivity.step("Melanjutkan download yang dijeda")
         startDownload(appId)
     }
 

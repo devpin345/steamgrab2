@@ -41,6 +41,7 @@ import `in`.dragonbra.javasteam.steam.cdn.Client as CdnClient
 import `in`.dragonbra.javasteam.steam.handlers.steamcontent.SteamContent
 import `in`.dragonbra.javasteam.steam.steamclient.AsyncJobFailedException
 import `in`.dragonbra.javasteam.types.KeyValue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -349,36 +350,81 @@ class SteamRepository private constructor(context: Context) {
             // Yang sudah diunduh pada sesi sebelumnya (dijeda atau dibatalkan) dibaca dari appmanifest sebelum
             // appmanifest ditulis ulang di bawah. Library memakai ulang file yang sudah valid, jadi hitungan
             // kita harus ikut melanjutkan dari situ, bukan mulai dari nol.
-            val prior = Storage.downloadedBefore(appId, GameSizeStore.get(appId)?.download ?: 0L)
+            val knownTotal = GameSizeStore.get(appId)?.download ?: 0L
+            val previous = Storage.downloadedBefore(appId, knownTotal)
+            // Game yang sudah tercatat selesai lalu diperiksa ulang tidak boleh langsung tampil 100%: yang terjadi
+            // adalah pemeriksaan file, dan angka sebenarnya baru datang dari library sesudah itu.
+            val installedBefore = Storage.appStates()[appId]?.let { Storage.isComplete(it) } == true
+            val prior = if (installedBefore) 0L else previous
+            // Selama pemeriksaan ulang, catatan di appmanifest tidak boleh menyusut kalau pemeriksaan dihentikan
+            val persistFloor = if (installedBefore) previous else 0L
             // Ukuran tiap depot (tidak terkompresi) dari info app, untuk membobot persen dari library
             val depotDisk: Map<Int, Long> = appInfos[appId]
                 ?.let { kv -> selectedDepots(kv).mapNotNull { d -> d.disk?.let { d.depotId to it } }.toMap() }
                 ?: emptyMap()
-            // Progres tertinggi yang pernah ditampilkan. Tidak pernah mundur.
+            // Progres tertinggi yang pernah ditampilkan. Sebelum semua depot melapor tidak boleh mundur.
             val lastDone = AtomicLong(prior)
+            // Baru true setelah library dan penulisan appmanifest benar-benar selesai. Sebelum itu persen dibatasi 99%.
+            val completed = AtomicBoolean(false)
+            val finishedDepots: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+            // Tahap yang sudah diumumkan di panel detail, supaya tiap tahap hanya dicatat sekali
+            val announced: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+            DownloadActivity.setDepotsTotal(depotDisk.size)
+            if (installedBefore) {
+                DownloadActivity.step("Game ini sudah tercatat selesai. Semua file akan diperiksa ulang")
+            } else if (prior > 0L) {
+                DownloadActivity.step("Melanjutkan. Catatan sesi sebelumnya: ${formatBytes(prior)} sudah masuk")
+            }
 
             // Library dan appmanifest ditulis sejak awal. Selama download belum selesai, StateFlags bernilai
             // "belum selesai", jadi Steam di PC tahu game ini belum lengkap dan tidak menganggapnya terinstal.
+            DownloadActivity.step("Membuat folder library dan catatan awal (appmanifest)")
             runCatching {
                 Storage.ensureLibrary()
-                writeAppManifest(appId, emptyMap(), complete = false, downloaded = prior)
-            }.onFailure { DebugLog.log("Gagal menulis appmanifest awal: ${it.describe()}") }
+                writeAppManifest(appId, emptyMap(), complete = false, downloaded = maxOf(prior, persistFloor))
+            }.onSuccess {
+                DownloadActivity.step("Folder siap: Download/SteamGames/steamapps (common, libraryfolder.vdf, appmanifest_$appId.acf)")
+            }.onFailure {
+                DebugLog.log("Gagal menulis appmanifest awal: ${it.describe()}")
+                DownloadActivity.step("Gagal membuat folder atau appmanifest awal: ${it.describe().lineSequence().first()}")
+            }
             val failure = AtomicReference<Throwable?>(null)
             // Tahap yang sedang dikerjakan library sebelum chunk pertama masuk (manifest, alokasi, validasi)
             val phase = AtomicReference("Menyiapkan download...")
-            val category = AtomicReference("")
 
             val reportProgress = {
-                val raw = summarize(depots, phase.get(), GameSizeStore.get(appId)?.download, prior, depotDisk)
-                // Persen dari library baru lengkap setelah semua file selesai diperiksa, jadi angkanya bisa
-                // turun sesaat. Yang ditampilkan hanya boleh naik.
-                val done = lastDone.accumulateAndGet(raw.doneBytes) { a, b -> if (a > b) a else b }
-                val percent = if (raw.totalBytes > 0L) {
-                    (done.toDouble() / raw.totalBytes).toFloat().coerceIn(0f, 1f)
+                val s = summarize(depots, GameSizeStore.get(appId)?.download, prior, depotDisk)
+                val isCompleted = completed.get()
+                // 100% hanya setelah semuanya selesai. Sebelum itu ada pekerjaan penutup (menunggu penulisan terakhir,
+                // menghapus file lama, menulis appmanifest) yang bisa memakan waktu lama.
+                val cap = if (isCompleted) 1.0 else MAX_FRACTION_BEFORE_DONE
+                val rawDone = (minOf(s.fraction, cap) * s.total).toLong()
+                // Sebelum semua depot melapor, persen dari library belum lengkap dan angkanya bisa turun sesaat,
+                // jadi yang ditampilkan hanya boleh naik. Sesudah semua melapor, angka library sudah lengkap dan
+                // boleh mengoreksi perkiraan yang terlalu tinggi.
+                val done = if (s.exact) {
+                    lastDone.set(rawDone)
+                    rawDone
                 } else {
-                    raw.percent
+                    lastDone.accumulateAndGet(rawDone) { a, b -> if (a > b) a else b }
                 }
-                onProgress(raw.copy(doneBytes = done, percent = percent))
+                val percent = when {
+                    isCompleted -> 1f
+                    s.total > 0.0 -> (done.toDouble() / s.total).toFloat().coerceIn(0f, MAX_FRACTION_BEFORE_DONE.toFloat())
+                    else -> 0f
+                }
+                val finishing = !isCompleted && depotDisk.isNotEmpty() && depotDisk.keys.all { it in finishedDepots }
+                onProgress(
+                    DownloadProgress(
+                        doneBytes = if (isCompleted && s.total > 0.0) s.total.toLong() else done,
+                        totalBytes = s.total.toLong(),
+                        percent = percent,
+                        phase = phase.get(),
+                        runBytes = s.thisRun.toLong(),
+                        finishing = finishing,
+                    )
+                )
             }
             // Tampilkan hasil sesi sebelumnya segera, sebelum library selesai memeriksa file yang ada
             reportProgress()
@@ -387,16 +433,37 @@ class SteamRepository private constructor(context: Context) {
                 override fun onStatusUpdate(message: String) {
                     val (text, cat) = phaseOf(message)
                     phase.set(text)
-                    // Hanya dicatat saat tahap berganti, supaya log tidak penuh oleh tiap file
-                    if (category.getAndSet(cat) != cat) DebugLog.log("Tahap: $text")
+                    val fileName = message.substringAfter(": ", "")
+                    when (cat) {
+                        "manifest" -> {
+                            // Satu pesan per depot, jumlahnya sedikit, jadi semuanya dicatat
+                            val depotId = message.removePrefix("Downloading manifest for depot ").trim()
+                            DownloadActivity.step("Mengunduh daftar file dari Steam (manifest depot $depotId)")
+                        }
+                        "alokasi" -> {
+                            DownloadActivity.fileAllocated()
+                            if (announced.add(cat)) {
+                                DownloadActivity.step("Menyiapkan file di penyimpanan (mengalokasikan ruang untuk tiap file)")
+                            }
+                            DownloadActivity.detail("Menyiapkan file: ${shortFileName(fileName)}")
+                        }
+                        "validasi" -> {
+                            DownloadActivity.fileChecked()
+                            if (announced.add(cat)) {
+                                DownloadActivity.step("Memeriksa ulang file yang sudah ada (cek checksum tiap bagian)")
+                            }
+                            DownloadActivity.detail("Memeriksa file: ${shortFileName(fileName)}")
+                        }
+                        else -> DownloadActivity.detail(text)
+                    }
                 }
 
                 override fun onItemAdded(item: DownloadItem) {
-                    DebugLog.log("Library menerima permintaan download")
+                    DownloadActivity.step("Permintaan download diterima library")
                 }
 
                 override fun onDownloadStarted(item: DownloadItem) {
-                    DebugLog.log("Library mulai memproses download")
+                    DownloadActivity.step("Library mulai memproses: memilih depot dan mengambil daftar file")
                 }
 
                 override fun onChunkCompleted(
@@ -406,6 +473,7 @@ class SteamRepository private constructor(context: Context) {
                     uncompressedBytes: Long
                 ) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, depotPercentComplete)
+                    markDataActivity(announced)
                     reportProgress()
                 }
 
@@ -417,12 +485,23 @@ class SteamRepository private constructor(context: Context) {
                         prev?.uncompressed ?: 0L,
                         depotPercentComplete
                     )
+                    DownloadActivity.fileWritten()
+                    markDataActivity(announced)
+                    DownloadActivity.detail("$DATA_ACTIVITY (file terakhir selesai: ${shortFileName(fileName)})")
                     reportProgress()
                 }
 
                 override fun onDepotCompleted(depotId: Int, compressedBytes: Long, uncompressedBytes: Long) {
                     depots[depotId] = DepotProgress(compressedBytes, uncompressedBytes, 1f)
-                    DebugLog.log("Depot $depotId selesai (${formatBytes(compressedBytes)})")
+                    finishedDepots.add(depotId)
+                    DownloadActivity.depotDone()
+                    DownloadActivity.step("Depot $depotId selesai (${formatBytes(compressedBytes)} terunduh)")
+                    if (depotDisk.isNotEmpty() && depotDisk.keys.all { it in finishedDepots }) {
+                        DownloadActivity.step(
+                            "Semua depot selesai. Library merapikan folder: menunggu penulisan terakhir, " +
+                                "menghapus file lama, menyimpan catatan. Tahap ini bisa memakan waktu"
+                        )
+                    }
                     reportProgress()
                 }
 
@@ -443,6 +522,7 @@ class SteamRepository private constructor(context: Context) {
                 maxFileWrites = 2
             )
             try {
+                DownloadActivity.step("Menghubungi Steam untuk memulai download")
                 downloader.addListener(listener)
                 downloader.add(
                     AppItem(
@@ -466,15 +546,24 @@ class SteamRepository private constructor(context: Context) {
                 failure.get()?.let { throw friendlyError(it) }
                 completion.get()
 
+                DownloadActivity.step("Library selesai. Mengambil info app untuk menulis appmanifest")
                 val app = fetchAppInfo(appId) ?: error("Info app $appId tidak ditemukan di Steam")
                 val installDir = app.keyValues["config"]["installdir"].asString()
                     ?: error("Nama folder install untuk app $appId kosong")
 
+                DownloadActivity.step("Menulis appmanifest_$appId.acf sebagai game terinstal (StateFlags 4)")
                 writeAppManifest(appId, snapshot(), complete = true, kv = app.keyValues)
+                completed.set(true)
+                reportProgress()
+                DownloadActivity.step("Selesai")
                 Storage.gameDir(installDir)
             } catch (e: Throwable) {
                 // Dijeda, dibatalkan, atau gagal: manifest tetap bertanda belum selesai, dengan jumlah byte yang sudah masuk
-                runCatching { writeAppManifest(appId, snapshot(), complete = false, downloaded = lastDone.get()) }
+                val stopped = if (e is java.util.concurrent.CancellationException) "Dihentikan (jeda atau batal)" else "Gagal"
+                DownloadActivity.step("$stopped. Menyimpan catatan progres ke appmanifest")
+                runCatching {
+                    writeAppManifest(appId, snapshot(), complete = false, downloaded = maxOf(lastDone.get(), persistFloor))
+                }
                 throw e
             } finally {
                 downloader.close()
@@ -585,47 +674,61 @@ class SteamRepository private constructor(context: Context) {
     /**
      * Menggabungkan progres semua depot. Total diperkirakan dari persen tiap depot,
      * jadi masih perkiraan sampai ukuran dari manifest tersedia.
+     * [Summary.exact] true kalau semua depot sudah melapor: persen dari library lalu lengkap dan dipakai apa adanya.
      */
     private fun summarize(
         depots: Map<Int, DepotProgress>,
-        phase: String,
         knownTotal: Long?,
         prior: Long,
         depotDisk: Map<Int, Long>,
-    ): DownloadProgress {
+    ): Summary {
         var thisRun = 0.0
-        var total = 0.0
+        var estimatedTotal = 0.0
         for (d in depots.values) {
             thisRun += d.compressed
-            if (d.percent > 0f) total += d.compressed / d.percent.toDouble()
+            if (d.percent > 0f) estimatedTotal += d.compressed / d.percent.toDouble()
         }
         // Kalau ukuran dari manifest sudah diketahui, pakai itu. Lebih akurat daripada perkiraan dari persen.
-        if (knownTotal != null && knownTotal > 0L) total = knownTotal.toDouble()
+        val total = if (knownTotal != null && knownTotal > 0L) knownTotal.toDouble() else estimatedTotal
+        if (total <= 0.0) return Summary(fraction = 0.0, total = 0.0, thisRun = thisRun, exact = false)
 
         // Sesi sebelumnya ditambah yang masuk sekarang. Library hanya mengunduh chunk yang belum ada,
         // jadi byte yang dilaporkannya hanya dari sesi ini.
-        var done = prior + thisRun
+        val byBytes = ((prior + thisRun) / total).coerceIn(0.0, 1.0)
 
-        // Persen dari library ikut menghitung data yang sudah ada di folder. Kalau lebih besar (misalnya
-        // folder berisi data dari sebelum ada catatan di appmanifest), pakai itu.
+        // Persen dari library ikut menghitung data yang sudah ada di folder, jadi lebih benar untuk folder yang
+        // sudah terisi (misalnya dari sebelum ada catatan di appmanifest).
         val diskTotal = depotDisk.values.sum()
-        if (diskTotal > 0L && total > 0.0) {
-            var fromLibrary = 0.0
-            for ((depotId, disk) in depotDisk) {
-                fromLibrary += (depots[depotId]?.percent ?: 0f).coerceIn(0f, 1f) * disk.toDouble()
-            }
-            done = maxOf(done, fromLibrary / diskTotal * total)
-        }
-        if (total > 0.0) done = minOf(done, total)
+        if (diskTotal <= 0L) return Summary(fraction = byBytes, total = total, thisRun = thisRun, exact = false)
 
-        val percent = if (total > 0.0) (done / total).toFloat().coerceIn(0f, 1f) else 0f
-        return DownloadProgress(
-            doneBytes = done.toLong(),
-            totalBytes = total.toLong(),
-            percent = percent,
-            phase = phase,
-            runBytes = thisRun.toLong()
-        )
+        var weighted = 0.0
+        for ((depotId, disk) in depotDisk) {
+            weighted += (depots[depotId]?.percent ?: 0f).coerceIn(0f, 1f) * disk.toDouble()
+        }
+        val byLibrary = (weighted / diskTotal).coerceIn(0.0, 1.0)
+
+        // Setelah semua depot melapor, angka library lengkap. Itu yang paling dekat dengan kenyataan, termasuk
+        // kalau perkiraan dari byte terkompresi terlalu tinggi (ukuran unduhan dari info app bisa meleset).
+        val allReported = depotDisk.keys.all { depots.containsKey(it) }
+        return if (allReported) {
+            Summary(fraction = byLibrary, total = total, thisRun = thisRun, exact = true)
+        } else {
+            Summary(fraction = maxOf(byBytes, byLibrary), total = total, thisRun = thisRun, exact = false)
+        }
+    }
+
+    /** Hasil penggabungan progres: [fraction] 0..1 dari [total] byte, [thisRun] byte terkompresi yang masuk sesi ini. */
+    private class Summary(val fraction: Double, val total: Double, val thisRun: Double, val exact: Boolean)
+
+    /** Dipanggil tiap ada data yang masuk. Mengumumkan tahap data satu kali dan menjaga baris kegiatan saat ini. */
+    private fun markDataActivity(announced: MutableSet<String>) {
+        if (announced.add("data")) {
+            DownloadActivity.step(
+                "Mulai mengunduh data game. Tiap bagian diunduh, didekompresi, lalu ditulis ke file, " +
+                    "semuanya berjalan bersamaan"
+            )
+        }
+        if (!DownloadActivity.now.value.text.startsWith(DATA_ACTIVITY)) DownloadActivity.detail(DATA_ACTIVITY)
     }
 
     /** Menerjemahkan pesan tahap dari library ke teks Indonesia, plus kategorinya untuk keperluan log. */
@@ -871,6 +974,9 @@ class SteamRepository private constructor(context: Context) {
         private const val RECONNECT_WAIT_MS = 45_000L
         // Percobaan sambung yang tidak dijawab selama ini dianggap macet, jadi boleh dicoba lagi
         private const val CONNECT_STALE_MS = 30_000L
+        // Persen yang ditampilkan tidak melewati ini sebelum download benar-benar selesai
+        private const val MAX_FRACTION_BEFORE_DONE = 0.99
+        private const val DATA_ACTIVITY = "Mengunduh, mendekompresi, dan menulis data game"
 
         @Volatile private var instance: SteamRepository? = null
 

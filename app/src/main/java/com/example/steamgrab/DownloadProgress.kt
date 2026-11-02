@@ -19,6 +19,8 @@ data class DownloadProgress(
     // Byte yang benar-benar lewat jaringan sejak sesi ini dimulai. Dipakai untuk menghitung kecepatan,
     // karena doneBytes bisa melompat saat sesi sebelumnya dihitung masuk.
     val runBytes: Long = 0L,
+    // Semua depot sudah melapor selesai, tinggal pekerjaan penutup library (menghapus file usang, menyimpan catatan)
+    val finishing: Boolean = false,
 )
 
 /** Menghitung kecepatan per detik dari selisih byte, dan menyimpan riwayatnya untuk grafik. */

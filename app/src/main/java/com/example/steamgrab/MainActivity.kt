@@ -55,6 +55,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private const val MENU_DEBUG = 1
 
@@ -551,6 +555,7 @@ fun DownloadScreen(
     // Baris keterangan: saat dijeda, saat ukuran sudah diketahui, atau tahap yang sedang berjalan
     val statusLine = when {
         state.paused -> "Dijeda. ${formatBytes(p.doneBytes)} sudah diunduh dan tidak hilang."
+        p.finishing -> "Hampir selesai. Semua bagian sudah diunduh, sedang merapikan folder dan menyimpan catatan..."
         known -> "Sudah diunduh ${formatBytes(p.doneBytes)} dari ${formatBytes(p.totalBytes)}"
         else -> p.phase.ifBlank { "Menyiapkan download..." }
     }
@@ -597,6 +602,9 @@ fun DownloadScreen(
             Text(statusLine, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(16.dp))
 
+            ActivityPanel(paused = state.paused)
+            Spacer(Modifier.height(16.dp))
+
             if (!state.paused) {
                 Text(
                     "Download tetap berjalan walau layar dikunci atau aplikasi ditutup. Pantau dari notifikasi.",
@@ -615,6 +623,107 @@ fun DownloadScreen(
             }
             Spacer(Modifier.height(8.dp))
             TextButton(onClick = onBack) { Text("Ke daftar game") }
+        }
+    }
+}
+
+/** Jumlah baris catatan yang ditampilkan di panel detail, terbaru di atas. */
+private const val ACTIVITY_LINES_SHOWN = 80
+
+/**
+ * Panel kegiatan: satu baris tentang yang sedang dikerjakan, dan tombol untuk membuka catatan lengkap berjam
+ * beserta hitungan file. Beberapa tahap berjalan bersamaan, jadi baris ini mengikuti kejadian terbaru.
+ */
+@Composable
+private fun ActivityPanel(paused: Boolean) {
+    val current by DownloadActivity.now.collectAsState()
+    val entries by DownloadActivity.entries.collectAsState()
+    val stats by DownloadActivity.stats.collectAsState()
+    var expanded by remember { mutableStateOf(false) }
+
+    // Detik berjalan, supaya "berjalan ..." tetap bergerak walau belum ada kejadian baru
+    val nowMs by produceState(initialValue = System.currentTimeMillis()) {
+        while (true) {
+            delay(1000L)
+            value = System.currentTimeMillis()
+        }
+    }
+    val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text(
+                if (paused) "Terakhir dikerjakan" else "Sedang dikerjakan",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                current.text.ifBlank { "Menyiapkan..." },
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = if (expanded) 5 else 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (!paused && current.sinceMs > 0L) {
+                Text(
+                    "Langkah ini berjalan ${formatElapsed((nowMs - current.sinceMs) / 1000L)}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            TextButton(
+                onClick = { expanded = !expanded },
+                contentPadding = PaddingValues(0.dp)
+            ) {
+                Text(if (expanded) "Sembunyikan detail" else "Tampilkan detail")
+            }
+
+            if (expanded) {
+                val counts = buildList {
+                    if (stats.depotsTotal > 0) add("Depot selesai: ${stats.depotsDone} dari ${stats.depotsTotal}")
+                    if (stats.filesAllocated > 0) add("File disiapkan di penyimpanan: ${stats.filesAllocated}")
+                    if (stats.filesChecked > 0) add("File diperiksa ulang: ${stats.filesChecked}")
+                    if (stats.filesWritten > 0) add("File selesai ditulis: ${stats.filesWritten}")
+                }
+                counts.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                if (counts.isNotEmpty()) Spacer(Modifier.height(8.dp))
+
+                Text(
+                    "Beberapa tahap berjalan bersamaan. Data dari Steam berbentuk terkompresi, jadi tiap bagian " +
+                        "didekompresi dulu sebelum ditulis ke file. Library tidak melaporkan dekompresi sebagai " +
+                        "tahap terpisah, jadi ia ikut dihitung di baris mengunduh dan menulis.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(8.dp))
+
+                val shown = entries.asReversed().take(ACTIVITY_LINES_SHOWN)
+                if (shown.isEmpty()) {
+                    Text("Belum ada catatan.", style = MaterialTheme.typography.bodySmall)
+                }
+                shown.forEach { entry ->
+                    Row(Modifier.padding(vertical = 2.dp)) {
+                        Text(
+                            timeFormat.format(Date(entry.timeMs)),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            entry.text,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                if (entries.size > ACTIVITY_LINES_SHOWN) {
+                    Text(
+                        "${entries.size - ACTIVITY_LINES_SHOWN} catatan lebih lama disembunyikan.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
         }
     }
 }

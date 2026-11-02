@@ -122,8 +122,10 @@ class DownloadService : Service() {
                 }
             }
             try {
-                largeIcon = GameImages.load(appId)
-                val dir = SteamRepository.get(applicationContext).downloadGame(appId) { p -> latest = p }
+                // Logo notifikasi dimuat sambil jalan, supaya jaringan yang lambat tidak menunda mulainya download.
+                // Dijalankan di scope service, bukan anak job ini, supaya job download tidak ikut menunggunya.
+                scope.launch { largeIcon = GameImages.load(appId) }
+                val dir =SteamRepository.get(applicationContext).downloadGame(appId) { p -> latest = p }
                 finished = true
                 _status.value = DownloadStatus.Finished(appId, dir.absolutePath)
                 postResult("Selesai: $name")
@@ -226,8 +228,11 @@ class DownloadService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("$title · $pct%")
             .setContentText(
-                if (known) "${formatBytes(p.doneBytes)} / ${formatBytes(p.totalBytes)} · ${formatSpeed(speedBps)}"
-                else p.phase.ifBlank { "Menyiapkan download..." }
+                when {
+                    p.finishing -> "Menyelesaikan: merapikan folder dan menyimpan catatan..."
+                    known -> "${formatBytes(p.doneBytes)} / ${formatBytes(p.totalBytes)} · ${formatSpeed(speedBps)}"
+                    else -> p.phase.ifBlank { "Menyiapkan download..." }
+                }
             )
             .setContentIntent(openIntent)
             .setOnlyAlertOnce(true)
