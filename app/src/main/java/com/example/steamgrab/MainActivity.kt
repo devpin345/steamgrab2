@@ -205,18 +205,13 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
 
 enum class LibraryFilter { ALL, INSTALLED, NOT_INSTALLED }
 
-/** App ID game yang appmanifest-nya ada di folder steamapps, artinya sudah diunduh. */
+/** App ID game yang appmanifest-nya bertanda terinstal penuh (StateFlags 4), artinya sudah selesai diunduh. */
 private fun installedAppIds(): Set<Int> =
-    Storage.steamLibraryDir().listFiles()
-        ?.mapNotNull { f ->
-            if (f.name.startsWith("appmanifest_") && f.name.endsWith(".acf")) {
-                f.name.removePrefix("appmanifest_").removeSuffix(".acf").toIntOrNull()
-            } else {
-                null
-            }
-        }
-        ?.toSet()
-        ?: emptySet()
+    Storage.appStates().filterValues { Storage.isComplete(it) }.keys
+
+/** App ID game yang appmanifest-nya ada tetapi download-nya belum selesai (dijeda, dibatalkan, atau gagal). */
+private fun partialAppIds(): Set<Int> =
+    Storage.appStates().filterValues { !Storage.isComplete(it) }.keys
 
 /** Layar debug: log dengan jam, tombol Salin, Bersihkan, dan Tutup. Dibuka lewat dialog supaya isian login tidak hilang. */
 @OptIn(ExperimentalFoundationApi::class)
@@ -375,6 +370,7 @@ fun GameListScreen(
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(LibraryFilter.ALL) }
     val installed = remember(games) { installedAppIds() }
+    val partial = remember(games) { partialAppIds() }
     val running by DownloadService.status.collectAsState()
 
     val shown = games.filter { game ->
@@ -452,7 +448,11 @@ fun GameListScreen(
                             false -> "Berbayar"
                             null -> null
                         }
-                        val ownLabel = if (done) "Sudah diunduh" else "Dimiliki"
+                        val ownLabel = when {
+                            done -> "Sudah diunduh"
+                            game.appId in partial -> "Belum selesai"
+                            else -> "Dimiliki"
+                        }
                         Text(listOfNotNull("App ID ${game.appId}", priceLabel, ownLabel).joinToString(" · "))
                     },
                     trailingContent = {

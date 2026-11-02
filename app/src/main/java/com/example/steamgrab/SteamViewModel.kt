@@ -150,7 +150,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 DebugLog.log("Login berhasil, lanjut mengambil daftar game")
                 step = "mengambil daftar game"
                 _uiState.value = UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
-                val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGames() }
+                val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGamesResilient() }
                 val games = owned.map { GameInfo(it.appId, it.name) }
                 ownedGames = games
                 watchingAppId = null

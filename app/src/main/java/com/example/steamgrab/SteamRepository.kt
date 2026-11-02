@@ -27,10 +27,13 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
@@ -91,6 +94,13 @@ class SteamRepository private constructor(context: Context) {
     @Volatile private var activeSession: CredentialsAuthSession? = null
     @Volatile private var awaitingApproval = false
     @Volatile private var connected = false
+    // True dari balasan logOn OK sampai koneksi putus lagi. Dipakai untuk menunggu sesi pulih setelah sambung ulang.
+    @Volatile private var sessionActive = false
+    // Mencegah dua pemanggilan client.connect() bersamaan. connect() di library memakai assert, jadi sambung ulang
+    // otomatis yang bertabrakan dengan tombol Login menutup aplikasi di build debug.
+    private val connectLock = Any()
+    @Volatile private var connecting = false
+    @Volatile private var connectingSince = 0L
     private var pumpStarted = false
     // Dikirim ke UI saat status koneksi berubah (misalnya sedang menyambung ulang saat menunggu kode)
     @Volatile private var onStatus: ((String) -> Unit)? = null
@@ -101,14 +111,17 @@ class SteamRepository private constructor(context: Context) {
     init {
         manager.subscribe(ConnectedCallback::class.java) {
             connected = true
+            connecting = false
             DebugLog.log("Terhubung ke server Steam")
             scope.launch { startSession() }
         }
 
         manager.subscribe(DisconnectedCallback::class.java) { cb ->
             connected = false
+            sessionActive = false
             DebugLog.log("Koneksi ke Steam terputus (dibatalkan pengguna: ${cb.isUserInitiated})")
             if (!cb.isUserInitiated) {
+                connecting = false
                 // Kode yang sedang ditunggu ikut batal. Setelah tersambung, Steam akan meminta kode lagi.
                 pendingGuard?.cancel(false)
                 pendingGuard = null
@@ -117,7 +130,7 @@ class SteamRepository private constructor(context: Context) {
                 onStatus?.invoke("Koneksi ke Steam terputus, menyambung ulang...")
                 scope.launch {
                     delay(2000L)
-                    client.connect()
+                    connectIfIdle()
                 }
             }
         }
@@ -125,6 +138,7 @@ class SteamRepository private constructor(context: Context) {
         manager.subscribe(LoggedOnCallback::class.java) { cb ->
             DebugLog.log("Steam membalas logOn: ${cb.result}")
             if (cb.result == EResult.OK) {
+                sessionActive = true
                 loggedOn.complete(Unit)
             } else {
                 // Token mungkin sudah tidak valid, hapus supaya login berikutnya minta kredensial lagi
@@ -160,14 +174,17 @@ class SteamRepository private constructor(context: Context) {
         this.onStatus = onStatus
         loggedOn = CompletableDeferred()
         licenseSignal = CompletableDeferred()
+        sessionActive = false
 
-        DebugLog.log("login: mulai (sudah terhubung: $connected)")
+        DebugLog.log("login: mulai (sudah terhubung: $connected, sedang menyambung: $connecting)")
         withContext(Dispatchers.IO) {
             ensurePump()
             if (connected) {
                 scope.launch { startSession() }
             } else {
-                client.connect()
+                // Kalau sambung ulang otomatis sedang berjalan, tidak menyambung lagi. Saat tersambung,
+                // ConnectedCallback menjalankan startSession dengan kredensial yang sudah disimpan di atas.
+                connectIfIdle()
             }
         }
 
@@ -175,6 +192,60 @@ class SteamRepository private constructor(context: Context) {
         DebugLog.log("login: loggedOn diterima")
         licenseSignal.await()
         DebugLog.log("login: daftar lisensi diterima")
+    }
+
+    /** Menyambung ke Steam kalau belum tersambung dan belum ada percobaan sambung yang berjalan. */
+    private fun connectIfIdle() {
+        synchronized(connectLock) {
+            val stale = System.currentTimeMillis() - connectingSince > CONNECT_STALE_MS
+            if (connected || (connecting && !stale)) {
+                DebugLog.log("Sambungan ke Steam sudah ada atau sedang dibuat, tidak menyambung lagi")
+                return
+            }
+            connecting = true
+            connectingSince = System.currentTimeMillis()
+        }
+        try {
+            client.connect()
+        } catch (e: Throwable) {
+            // AssertionError dari library adalah Error, bukan Exception, jadi harus ditangkap di sini
+            connecting = false
+            DebugLog.log("ERROR saat menyambung ke Steam: ${e.describe()}")
+            throw IllegalStateException("Gagal menyambung ke Steam: ${e.message ?: e.javaClass.simpleName}", e)
+        }
+    }
+
+    /**
+     * Menunggu sampai login ke Steam aktif lagi, misalnya setelah koneksi putus dan tersambung ulang.
+     * Status koneksi milik library ikut diperiksa: pekerjaan yang sedang berjalan gagal lebih dulu daripada
+     * callback "terputus" diproses, jadi sessionActive saja bisa masih bernilai true padahal sudah putus.
+     */
+    private suspend fun awaitSession(timeoutMs: Long): Boolean =
+        withTimeoutOrNull(timeoutMs) {
+            while (!(sessionActive && client.isConnected)) delay(300L)
+            true
+        } ?: false
+
+    /**
+     * Seperti [loadOwnedGames], tapi kalau koneksi putus di tengah jalan (misalnya karena pengguna berpindah
+     * aplikasi untuk menyetujui login), menunggu sampai tersambung lagi lalu mengulang, bukan langsung gagal.
+     */
+    suspend fun loadOwnedGamesResilient(): List<OwnedGame> {
+        var attempt = 0
+        while (true) {
+            try {
+                return loadOwnedGames()
+            } catch (e: Exception) {
+                // Kalau coroutine ini sendiri yang dibatalkan, jangan diulang
+                currentCoroutineContext().ensureActive()
+                if (attempt >= MAX_RECONNECT_RETRIES || !e.isConnectionLoss()) throw e
+                attempt++
+                DebugLog.log("Koneksi putus saat mengambil daftar game, menunggu sambung ulang (percobaan $attempt)")
+                onStatus?.invoke("Koneksi ke Steam terputus, menyambung ulang...")
+                if (!awaitSession(RECONNECT_WAIT_MS)) throw e
+                onStatus?.invoke("Mengambil daftar game...")
+            }
+        }
     }
 
     /** True jika library sedang menunggu kode Steam Guard dari pengguna. */
@@ -271,6 +342,15 @@ class SteamRepository private constructor(context: Context) {
         withContext(Dispatchers.IO) {
             DebugLog.log("Download game $appId dimulai")
             val depots = ConcurrentHashMap<Int, DepotProgress>()
+            // Byte yang sudah masuk per depot, dalam bentuk yang dipakai appmanifest
+            val snapshot = { depots.mapValues { it.value.compressed to it.value.uncompressed } }
+
+            // Library dan appmanifest ditulis sejak awal. Selama download belum selesai, StateFlags bernilai
+            // "belum selesai", jadi Steam di PC tahu game ini belum lengkap dan tidak menganggapnya terinstal.
+            runCatching {
+                Storage.ensureLibrary()
+                writeAppManifest(appId, emptyMap(), complete = false)
+            }.onFailure { DebugLog.log("Gagal menulis appmanifest awal: ${it.describe()}") }
             val failure = AtomicReference<Throwable?>(null)
             // Tahap yang sedang dikerjakan library sebelum chunk pertama masuk (manifest, alokasi, validasi)
             val phase = AtomicReference("Menyiapkan download...")
@@ -363,8 +443,12 @@ class SteamRepository private constructor(context: Context) {
                 val installDir = app.keyValues["config"]["installdir"].asString()
                     ?: error("Nama folder install untuk app $appId kosong")
 
-                writeAppManifest(app, installDir, depots.mapValues { it.value.compressed to it.value.uncompressed })
+                writeAppManifest(appId, snapshot(), complete = true, kv = app.keyValues)
                 Storage.gameDir(installDir)
+            } catch (e: Throwable) {
+                // Dijeda, dibatalkan, atau gagal: manifest tetap bertanda belum selesai, dengan jumlah byte yang sudah masuk
+                runCatching { writeAppManifest(appId, snapshot(), complete = false) }
+                throw e
             } finally {
                 downloader.close()
             }
@@ -638,42 +722,73 @@ class SteamRepository private constructor(context: Context) {
         return res.results.flatMap { it.apps.values }.firstOrNull { it.id == appId }
     }
 
-    /** Menulis appmanifest supaya Steam di PC menganggap game ini sudah terinstal. */
-    private fun writeAppManifest(app: PICSProductInfo, installDir: String, depots: Map<Int, Pair<Long, Long>>) {
-        val kv = app.keyValues
-        val name = kv["common"]["name"].asString() ?: "App ${app.id}"
+    /**
+     * Menulis appmanifest dengan susunan seperti yang dibuat Steam di PC. [complete] = true menandai game
+     * terinstal penuh (StateFlags 4). Kalau false, game ditandai belum selesai (1026) beserta jumlah byte yang
+     * sudah masuk, supaya Steam di PC tahu harus melanjutkan dan tidak menganggap game ini lengkap.
+     * [depots] berisi (byte terkompresi, byte tidak terkompresi) yang sudah masuk per depot.
+     */
+    private fun writeAppManifest(
+        appId: Int,
+        depots: Map<Int, Pair<Long, Long>>,
+        complete: Boolean,
+        kv: KeyValue? = appInfos[appId],
+    ) {
+        if (kv == null) return
+        val installDir = kv["config"]["installdir"].asString() ?: return
+        val name = kv["common"]["name"].asString() ?: "App $appId"
         val buildId = kv["depots"]["branches"]["public"]["buildid"].asString() ?: "0"
-        val compressedTotal = depots.values.sumOf { it.first }
-        val uncompressedTotal = depots.values.sumOf { it.second }
+        val doneCompressed = depots.values.sumOf { it.first }
+        val doneUncompressed = depots.values.sumOf { it.second }
+        val total = GameSizeStore.get(appId)
+        // Kalau sudah selesai, yang sudah masuk itulah totalnya. Kalau belum, pakai ukuran penuh game.
+        val toDownload = if (complete) doneCompressed else (total?.download ?: 0L)
+        val toStage = if (complete) doneUncompressed else (total?.disk ?: 0L)
+        val owner = client.steamID?.convertToUInt64() ?: 0L
+        val state = if (complete) Storage.STATE_INSTALLED else Storage.STATE_PARTIAL
+
+        fun line(key: String, value: Any) = "\t\"$key\"\t\t\"$value\"\n"
 
         val text = buildString {
-            appendLine("\"AppState\"")
-            appendLine("{")
-            appendLine("\t\"appid\"\t\t\"${app.id}\"")
-            appendLine("\t\"Universe\"\t\t\"1\"")
-            appendLine("\t\"name\"\t\t\"${vdfEscape(name)}\"")
-            appendLine("\t\"StateFlags\"\t\t\"4\"")
-            appendLine("\t\"installdir\"\t\t\"${vdfEscape(installDir)}\"")
-            appendLine("\t\"LastUpdated\"\t\t\"${System.currentTimeMillis() / 1000}\"")
-            appendLine("\t\"SizeOnDisk\"\t\t\"$uncompressedTotal\"")
-            appendLine("\t\"buildid\"\t\t\"$buildId\"")
-            appendLine("\t\"BytesToDownload\"\t\t\"$compressedTotal\"")
-            appendLine("\t\"BytesDownloaded\"\t\t\"$compressedTotal\"")
-            appendLine("\t\"InstalledDepots\"")
-            appendLine("\t{")
-            for ((depotId, sizes) in depots) {
-                val manifestId = kv["depots"][depotId.toString()]["manifests"]["public"]["gid"].asString() ?: "0"
-                appendLine("\t\t\"$depotId\"")
-                appendLine("\t\t{")
-                appendLine("\t\t\t\"manifest\"\t\t\"$manifestId\"")
-                appendLine("\t\t\t\"size\"\t\t\"${sizes.second}\"")
-                appendLine("\t\t}")
+            append("\"AppState\"\n{\n")
+            append(line("appid", appId))
+            append(line("Universe", 1))
+            append(line("name", vdfEscape(name)))
+            append(line("StateFlags", state))
+            append(line("installdir", vdfEscape(installDir)))
+            append(line("LastUpdated", System.currentTimeMillis() / 1000))
+            append(line("LastPlayed", 0))
+            append(line("SizeOnDisk", doneUncompressed))
+            append(line("StagingSize", 0))
+            // Game yang belum selesai belum punya build terpasang. Build tujuannya ada di TargetBuildID.
+            append(line("buildid", if (complete) buildId else "0"))
+            if (owner != 0L) append(line("LastOwner", owner))
+            append(line("UpdateResult", 0))
+            append(line("BytesToDownload", toDownload))
+            append(line("BytesDownloaded", doneCompressed))
+            append(line("BytesToStage", toStage))
+            append(line("BytesStaged", doneUncompressed))
+            append(line("TargetBuildID", buildId))
+            append(line("AutoUpdateBehavior", 0))
+            append(line("AllowOtherDownloadsWhileRunning", 0))
+            append(line("ScheduledAutoUpdate", 0))
+            if (complete) {
+                append("\t\"InstalledDepots\"\n\t{\n")
+                for ((depotId, sizes) in depots) {
+                    val manifestId = kv["depots"][depotId.toString()]["manifests"]["public"]["gid"].asString() ?: "0"
+                    append("\t\t\"$depotId\"\n\t\t{\n")
+                    append("\t\t\t\"manifest\"\t\t\"$manifestId\"\n")
+                    append("\t\t\t\"size\"\t\t\"${sizes.second}\"\n")
+                    append("\t\t}\n")
+                }
+                append("\t}\n")
             }
-            appendLine("\t}")
-            appendLine("}")
+            append("\t\"UserConfig\"\n\t{\n\t\t\"language\"\t\t\"english\"\n\t}\n")
+            append("\t\"MountedConfig\"\n\t{\n\t\t\"language\"\t\t\"english\"\n\t}\n")
+            append("}\n")
         }
 
-        val file = Storage.manifestFile(app.id)
+        val file = Storage.manifestFile(appId)
         file.parentFile?.mkdirs()
         file.writeText(text)
     }
@@ -683,6 +798,10 @@ class SteamRepository private constructor(context: Context) {
     companion object {
         private const val KEY_ACCOUNT = "account"
         private const val KEY_TOKEN = "refresh_token"
+        private const val MAX_RECONNECT_RETRIES = 3
+        private const val RECONNECT_WAIT_MS = 45_000L
+        // Percobaan sambung yang tidak dijawab selama ini dianggap macet, jadi boleh dicoba lagi
+        private const val CONNECT_STALE_MS = 30_000L
 
         @Volatile private var instance: SteamRepository? = null
 
