@@ -45,6 +45,7 @@ sealed class UiState {
         val paused: Boolean = false,
         val diskBps: Long = 0L,
         val diskHistory: List<Long> = emptyList(),
+        val platform: Platform = Platform.WINDOWS,
     ) : UiState()
 
     data class Done(val savedPath: String) : UiState()
@@ -70,6 +71,10 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     private val _storageAlert = MutableStateFlow<StorageAlert?>(null)
     val storageAlert: StateFlow<StorageAlert?> = _storageAlert.asStateFlow()
 
+    /** Popup pilih versi (Windows, macOS, Linux). Hanya muncul kalau game punya lebih dari satu versi. */
+    private val _platformChoice = MutableStateFlow<PlatformChoice?>(null)
+    val platformChoice: StateFlow<PlatformChoice?> = _platformChoice.asStateFlow()
+
     private var ownedGames: List<GameInfo> = emptyList()
     private var watchingAppId: Int? = null
     private var sizeJob: Job? = null
@@ -78,6 +83,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         GamePriceStore.init(app)
+        PlatformStore.init(app)
         // Status download datang dari DownloadService, UI hanya menampilkannya
         viewModelScope.launch {
             DownloadService.status.collect { onDownloadStatus(it) }
@@ -177,11 +183,34 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val game = ownedGames.find { it.appId == appId } ?: return
+        // Versi yang tidak tersedia untuk game ini tidak ditawarkan. Kalau hanya ada satu, langsung diunduh.
+        val platforms = repo.availablePlatforms(appId).ifEmpty { listOf(Platform.WINDOWS) }
+        if (platforms.size > 1) {
+            _platformChoice.value = PlatformChoice(
+                appId, game.name, platforms.map { PlatformOption(it, repo.knownSize(appId, it)) }
+            )
+            return
+        }
+        requestDownload(appId, platforms.first())
+    }
+
+    /** Pengguna memilih versi di popup. Lanjut ke pengecekan ruang dan download. */
+    fun choosePlatform(appId: Int, platform: Platform) {
+        _platformChoice.value = null
+        requestDownload(appId, platform)
+    }
+
+    fun dismissPlatformChoice() {
+        _platformChoice.value = null
+    }
+
+    private fun requestDownload(appId: Int, platform: Platform) {
+        val game = ownedGames.find { it.appId == appId } ?: return
         viewModelScope.launch {
             // Catatan kegiatan untuk panel detail di layar download dimulai dari pengecekan ruang
             DownloadActivity.reset()
-            DownloadActivity.step("Mengecek ruang penyimpanan")
-            val check = withContext(Dispatchers.IO) { checkStorage(appId) }
+            DownloadActivity.step("Mengecek ruang penyimpanan untuk versi ${platform.label}")
+            val check = withContext(Dispatchers.IO) { checkStorage(appId, platform) }
             if (check != null && check.first > check.second) {
                 DebugLog.log("Memori tidak cukup untuk ${game.name}")
                 _storageAlert.value = StorageAlert(game.name, check.first, check.second)
@@ -193,7 +222,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     DownloadActivity.step("Ukuran game belum diketahui, download tetap dimulai")
                 }
-                startDownload(appId)
+                startDownload(appId, platform)
             }
         }
     }
@@ -206,10 +235,13 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
      * Mengembalikan (butuh, tersedia) dalam byte. Null kalau ukuran game belum bisa dihitung,
      * dan download tetap dicoba.
      */
-    private suspend fun checkStorage(appId: Int): Pair<Long, Long>? {
-        val size = GameSizeStore.get(appId) ?: try {
+    private suspend fun checkStorage(appId: Int, platform: Platform): Pair<Long, Long>? {
+        val size = repo.knownSize(appId, platform) ?: try {
             DownloadActivity.step("Menghitung ukuran game dari info Steam")
-            repo.computeDownloadSize(appId).also { GameSizeStore.put(appId, it) }
+            repo.computeDownloadSize(appId, platform).also {
+                // Hanya ukuran versi bawaan yang masuk ke penyimpanan dan daftar game
+                if (platform == repo.defaultPlatform(appId)) GameSizeStore.put(appId, it)
+            }
         } catch (e: Exception) {
             DebugLog.log("Ukuran game belum diketahui, download tetap dicoba: ${e.describe()}")
             return null
@@ -270,7 +302,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun startDownload(appId: Int) {
+    fun startDownload(appId: Int, platform: Platform = PlatformStore.get(appId) ?: repo.defaultPlatform(appId)) {
         // Hanya satu download dalam satu waktu. Kalau masih ada yang berjalan, tampilkan progres itu.
         if (DownloadService.status.value is DownloadStatus.Running) {
             DebugLog.log("Masih ada download yang berjalan, menampilkan progresnya")
@@ -280,13 +312,16 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
 
         val game = ownedGames.find { it.appId == appId } ?: return
         watchingAppId = appId
-        _uiState.value = UiState.Downloading(appId, game.name, DownloadProgress(), 0L, emptyList())
+        // Dicatat supaya Lanjutkan setelah jeda memakai versi yang sama
+        PlatformStore.put(appId, platform)
+        _uiState.value = UiState.Downloading(appId, game.name, DownloadProgress(), 0L, emptyList(), platform = platform)
 
         val ctx = getApplication<Application>()
         ctx.startForegroundService(
             Intent(ctx, DownloadService::class.java)
                 .putExtra(DownloadService.EXTRA_APP_ID, appId)
                 .putExtra(DownloadService.EXTRA_NAME, game.name)
+                .putExtra(DownloadService.EXTRA_OS, platform.steamName)
         )
     }
 
@@ -363,8 +398,15 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun DownloadStatus.Running.toUi(): UiState.Downloading =
-        UiState.Downloading(appId, name, progress, speedBps, speedHistory, diskBps = diskBps, diskHistory = diskHistory)
+        UiState.Downloading(
+            appId, name, progress, speedBps, speedHistory,
+            diskBps = diskBps, diskHistory = diskHistory,
+            platform = PlatformStore.get(appId) ?: Platform.WINDOWS
+        )
 
     private fun DownloadStatus.Paused.toUi(): UiState.Downloading =
-        UiState.Downloading(appId, name, progress, 0L, emptyList(), paused = true)
+        UiState.Downloading(
+            appId, name, progress, 0L, emptyList(), paused = true,
+            platform = PlatformStore.get(appId) ?: Platform.WINDOWS
+        )
 }

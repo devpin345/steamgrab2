@@ -348,8 +348,9 @@ class SteamRepository private constructor(context: Context) {
         appIds
             // Hanya game. DLC, demo, dan tool disembunyikan. Tipe yang tidak diketahui tetap ditampilkan.
             .filter { types[it] == null || types[it] == "game" }
-            // Game tanpa depot untuk Windows 64-bit (misalnya server dedicated) tidak bisa diunduh, jadi disembunyikan
-            .filter { appInfos[it]?.let { kv -> selectedDepots(kv).isNotEmpty() } ?: true }
+            // Game tanpa depot untuk satu pun versi yang didukung (Windows, macOS, Linux; 64-bit) tidak bisa diunduh,
+            // jadi disembunyikan
+            .filter { appInfos[it]?.let { kv -> availablePlatforms(kv).isNotEmpty() } ?: true }
             .map { OwnedGame(it, names[it] ?: "App $it") }
             .sortedBy { it.name.lowercase() }
     }
@@ -360,9 +361,9 @@ class SteamRepository private constructor(context: Context) {
      * Pembatalan dilakukan dengan membatalkan coroutine pemanggilnya.
      * [onProgress] dipanggil setiap ada chunk yang selesai, dengan progres semua depot digabung.
      */
-    suspend fun downloadGame(appId: Int, onProgress: (DownloadProgress) -> Unit): File =
+    suspend fun downloadGame(appId: Int, platform: Platform, onProgress: (DownloadProgress) -> Unit): File =
         withContext(Dispatchers.IO) {
-            DebugLog.log("Download game $appId dimulai")
+            DebugLog.log("Download game $appId dimulai (versi ${platform.label})")
             val depots = ConcurrentHashMap<Int, DepotProgress>()
             // Byte yang sudah masuk per depot pada sesi ini, dalam bentuk yang dipakai appmanifest
             val snapshot = { depots.mapValues { it.value.compressed to it.value.uncompressed } }
@@ -370,7 +371,9 @@ class SteamRepository private constructor(context: Context) {
             // Yang sudah diunduh pada sesi sebelumnya (dijeda atau dibatalkan) dibaca dari appmanifest sebelum
             // appmanifest ditulis ulang di bawah. Library memakai ulang file yang sudah valid, jadi hitungan
             // kita harus ikut melanjutkan dari situ, bukan mulai dari nol.
-            val knownTotal = GameSizeStore.get(appId)?.download ?: 0L
+            // Ukuran untuk versi yang dipilih. Ukuran tiap versi berbeda, jadi bukan selalu yang ada di daftar game.
+            val size = knownSize(appId, platform)
+            val knownTotal = size?.download ?: 0L
             val previous = Storage.downloadedBefore(appId, knownTotal)
             // Game yang sudah tercatat selesai lalu diperiksa ulang tidak boleh langsung tampil 100%: yang terjadi
             // adalah pemeriksaan file, dan angka sebenarnya baru datang dari library sesudah itu.
@@ -380,7 +383,7 @@ class SteamRepository private constructor(context: Context) {
             val persistFloor = if (installedBefore) previous else 0L
             // Ukuran tiap depot (tidak terkompresi) dari info app, untuk membobot persen dari library
             val depotDisk: Map<Int, Long> = appInfos[appId]
-                ?.let { kv -> selectedDepots(kv).mapNotNull { d -> d.disk?.let { d.depotId to it } }.toMap() }
+                ?.let { kv -> selectedDepots(kv, platform).mapNotNull { d -> d.disk?.let { d.depotId to it } }.toMap() }
                 ?: emptyMap()
             // Progres tertinggi yang pernah ditampilkan. Sebelum semua depot melapor tidak boleh mundur.
             val lastDone = AtomicLong(prior)
@@ -391,6 +394,7 @@ class SteamRepository private constructor(context: Context) {
             val announced: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
             DownloadActivity.setDepotsTotal(depotDisk.size)
+            DownloadActivity.step("Versi yang diunduh: ${platform.label} (64-bit, bahasa Inggris)")
             if (installedBefore) {
                 DownloadActivity.step("Game ini sudah tercatat selesai. Semua file akan diperiksa ulang")
             } else if (prior > 0L) {
@@ -402,7 +406,7 @@ class SteamRepository private constructor(context: Context) {
             DownloadActivity.step("Membuat folder library dan catatan awal (appmanifest)")
             runCatching {
                 Storage.ensureLibrary()
-                writeAppManifest(appId, emptyMap(), complete = false, downloaded = maxOf(prior, persistFloor))
+                writeAppManifest(appId, emptyMap(), complete = false, downloaded = maxOf(prior, persistFloor), total = size)
             }.onSuccess {
                 DownloadActivity.step("Folder siap: Download/SteamGames/steamapps (common, libraryfolder.vdf, appmanifest_$appId.acf)")
             }.onFailure {
@@ -414,7 +418,7 @@ class SteamRepository private constructor(context: Context) {
             val phase = AtomicReference("Menyiapkan download...")
 
             val reportProgress = {
-                val s = summarize(depots, GameSizeStore.get(appId)?.download, prior, depotDisk)
+                val s = summarize(depots, size?.download, prior, depotDisk)
                 val isCompleted = completed.get()
                 // 100% hanya setelah semuanya selesai. Sebelum itu ada pekerjaan penutup (menunggu penulisan terakhir,
                 // menghapus file lama, menulis appmanifest) yang bisa memakan waktu lama.
@@ -551,7 +555,7 @@ class SteamRepository private constructor(context: Context) {
                         installToGameNameDirectory = true,
                         installDirectory = Storage.commonDir().absolutePath,
                         branch = "public",
-                        os = "windows",
+                        os = platform.steamName,
                         osArch = "64",
                         language = "english",
                     )
@@ -573,7 +577,7 @@ class SteamRepository private constructor(context: Context) {
                     ?: error("Nama folder install untuk app $appId kosong")
 
                 DownloadActivity.step("Menulis appmanifest_$appId.acf sebagai game terinstal (StateFlags 4)")
-                writeAppManifest(appId, snapshot(), complete = true, kv = app.keyValues)
+                writeAppManifest(appId, snapshot(), complete = true, kv = app.keyValues, total = size)
                 completed.set(true)
                 reportProgress()
                 DownloadActivity.step("Selesai")
@@ -583,7 +587,7 @@ class SteamRepository private constructor(context: Context) {
                 val stopped = if (e is java.util.concurrent.CancellationException) "Dihentikan (jeda atau batal)" else "Gagal"
                 DownloadActivity.step("$stopped. Menyimpan catatan progres ke appmanifest")
                 runCatching {
-                    writeAppManifest(appId, snapshot(), complete = false, downloaded = maxOf(lastDone.get(), persistFloor))
+                    writeAppManifest(appId, snapshot(), complete = false, downloaded = maxOf(lastDone.get(), persistFloor), total = size)
                 }
                 throw e
             } finally {
@@ -601,15 +605,16 @@ class SteamRepository private constructor(context: Context) {
      * tidak menyertakan ukuran, jatuh ke cara lama: mengunduh manifest depot itu.
      * Pilihan depot sama dengan yang dipakai library saat download.
      */
-    suspend fun computeDownloadSize(appId: Int): GameSize = withContext(Dispatchers.IO) {
+    suspend fun computeDownloadSize(appId: Int, platform: Platform? = null): GameSize = withContext(Dispatchers.IO) {
         val kv = appInfos[appId] ?: error("Info app $appId belum dimuat")
-        val depots = selectedDepots(kv)
+        val chosen = platform ?: defaultPlatform(appId)
+        val depots = selectedDepots(kv, chosen)
         if (depots.isEmpty()) return@withContext GameSize(0L, 0L)
 
-        if (depots.all { it.download != null && it.disk != null }) {
-            val quick = GameSize(depots.sumOf { it.download ?: 0L }, depots.sumOf { it.disk ?: 0L })
+        quickSize(depots)?.let { quick ->
             DebugLog.log(
-                "Ukuran app $appId dari info app: unduh ${formatBytes(quick.download)}, disk ${formatBytes(quick.disk)}"
+                "Ukuran app $appId (${chosen.label}) dari info app: unduh ${formatBytes(quick.download)}, " +
+                    "disk ${formatBytes(quick.disk)}"
             )
             return@withContext quick
         }
@@ -659,11 +664,69 @@ class SteamRepository private constructor(context: Context) {
             download += manifest.totalCompressedSize
             disk += manifest.totalUncompressedSize
         }
-        GameSize(download, disk)
+        GameSize(download, disk).also {
+            // Ukuran versi bawaan disimpan oleh pemanggil di GameSizeStore. Versi lain disimpan di memori.
+            if (chosen != defaultPlatform(appId)) platformSizes["$appId/${chosen.steamName}"] = it
+        }
     }
 
-    /** Depot untuk Windows 64-bit bahasa Inggris, beserta ID manifest publiknya. */
-    private fun selectedDepots(kv: KeyValue): List<DepotChoice> =
+    // Ukuran versi selain versi bawaan, per "appId/os". Versi bawaan memakai GameSizeStore.
+    private val platformSizes = ConcurrentHashMap<String, GameSize>()
+
+    /**
+     * Versi yang tersedia untuk game ini, berurutan Windows, macOS, Linux. Satu versi dianggap tersedia kalau
+     * ada depot yang akan diunduh library untuknya DAN Steam menyatakan game itu mendukung OS tersebut
+     * (common/oslist). Tanpa common/oslist, macOS dan Linux hanya dianggap tersedia kalau ada depot yang
+     * khusus menyebutnya, supaya depot bersama (tanpa daftar OS) tidak membuat semua versi tampak tersedia.
+     * Kosong kalau info app belum dimuat.
+     */
+    fun availablePlatforms(appId: Int): List<Platform> =
+        appInfos[appId]?.let { availablePlatforms(it) } ?: emptyList()
+
+    private fun availablePlatforms(kv: KeyValue): List<Platform> {
+        val common = kv["common"]["oslist"].value
+            ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+            ?.takeIf { it.isNotEmpty() }
+        return Platform.values().filter { p ->
+            when {
+                selectedDepots(kv, p).isEmpty() -> false
+                common != null -> p.steamName in common
+                else -> p == Platform.WINDOWS || hasDepotFor(kv, p)
+            }
+        }
+    }
+
+    /** True kalau ada depot yang daftar OS-nya menyebut versi ini secara khusus. */
+    private fun hasDepotFor(kv: KeyValue, platform: Platform): Boolean =
+        kv["depots"].children.any { section ->
+            section["config"]["oslist"].value?.split(",")?.contains(platform.steamName) == true
+        }
+
+    /** Versi yang dipilih kalau pengguna tidak memilih: yang pertama tersedia, biasanya Windows. */
+    fun defaultPlatform(appId: Int): Platform = availablePlatforms(appId).firstOrNull() ?: Platform.WINDOWS
+
+    /**
+     * Ukuran game untuk satu versi kalau sudah diketahui tanpa jaringan: dari penyimpanan (versi bawaan),
+     * dari memori, atau dari info app. Null kalau belum bisa diketahui.
+     */
+    fun knownSize(appId: Int, platform: Platform): GameSize? {
+        if (platform == defaultPlatform(appId)) GameSizeStore.get(appId)?.let { return it }
+        val key = "$appId/${platform.steamName}"
+        platformSizes[key]?.let { return it }
+        val kv = appInfos[appId] ?: return null
+        return quickSize(selectedDepots(kv, platform))?.also { platformSizes[key] = it }
+    }
+
+    /** Jumlah ukuran dari info app, atau null kalau tidak ada depot atau ada depot yang tidak menyertakan ukuran. */
+    private fun quickSize(depots: List<DepotChoice>): GameSize? =
+        if (depots.isNotEmpty() && depots.all { it.download != null && it.disk != null }) {
+            GameSize(depots.sumOf { it.download ?: 0L }, depots.sumOf { it.disk ?: 0L })
+        } else {
+            null
+        }
+
+    /** Depot untuk satu versi (64-bit, bahasa Inggris), beserta ID manifest publiknya. Aturannya sama dengan filter library. */
+    private fun selectedDepots(kv: KeyValue, platform: Platform): List<DepotChoice> =
         kv["depots"].children.mapNotNull { section ->
             val depotId = section.name?.toIntOrNull() ?: return@mapNotNull null
             if (section.children.isEmpty()) return@mapNotNull null
@@ -671,7 +734,7 @@ class SteamRepository private constructor(context: Context) {
             val cfg = section["config"]
             if (cfg != KeyValue.INVALID) {
                 val osList = cfg["oslist"].value
-                if (!osList.isNullOrBlank() && "windows" !in osList.split(",")) return@mapNotNull null
+                if (!osList.isNullOrBlank() && platform.steamName !in osList.split(",")) return@mapNotNull null
                 val osArch = cfg["osarch"].value
                 if (!osArch.isNullOrBlank() && osArch != "64") return@mapNotNull null
                 val language = cfg["language"].value
@@ -1021,12 +1084,12 @@ class SteamRepository private constructor(context: Context) {
         complete: Boolean,
         kv: KeyValue? = appInfos[appId],
         downloaded: Long? = null,
+        total: GameSize? = GameSizeStore.get(appId),
     ) {
         if (kv == null) return
         val installDir = kv["config"]["installdir"].asString() ?: return
         val name = kv["common"]["name"].asString() ?: "App $appId"
         val buildId = kv["depots"]["branches"]["public"]["buildid"].asString() ?: "0"
-        val total = GameSizeStore.get(appId)
         val runCompressed = depots.values.sumOf { it.first }
         val runUncompressed = depots.values.sumOf { it.second }
 

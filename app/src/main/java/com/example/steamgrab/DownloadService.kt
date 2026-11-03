@@ -66,7 +66,7 @@ class DownloadService : Service() {
     private var currentName = ""
     @Volatile private var latest = DownloadProgress()
     @Volatile private var largeIcon: Bitmap? = null
-    private val meter = SpeedMeter()
+    private val meter = NetworkMeter()
     private val disk = DiskMeter()
 
     override fun onCreate() {
@@ -97,6 +97,7 @@ class DownloadService : Service() {
 
         val appId = intent?.getIntExtra(EXTRA_APP_ID, -1) ?: -1
         val name = intent?.getStringExtra(EXTRA_NAME) ?: "App $appId"
+        val platform = Platform.fromSteamName(intent?.getStringExtra(EXTRA_OS))
         startForegroundCompat(buildNotification(name, DownloadProgress(), 0L))
 
         if (appId <= 0) {
@@ -113,9 +114,9 @@ class DownloadService : Service() {
         latest = DownloadProgress()
         largeIcon = null
         val startMs = System.currentTimeMillis()
-        meter.start(0L, startMs)
+        meter.start(startMs)
         disk.start(0L, startMs)
-        DebugLog.log("Kecepatan tulis disk diukur dari ${disk.sourceName}")
+        DebugLog.log("Kecepatan jaringan diukur dari ${meter.sourceName}, kecepatan tulis disk dari ${disk.sourceName}")
         publish(gen)
 
         job = scope.launch {
@@ -134,7 +135,7 @@ class DownloadService : Service() {
                 // Logo notifikasi dimuat sambil jalan, supaya jaringan yang lambat tidak menunda mulainya download.
                 // Dijalankan di scope service, bukan anak job ini, supaya job download tidak ikut menunggunya.
                 scope.launch { largeIcon = GameImages.load(appId) }
-                val dir =SteamRepository.get(applicationContext).downloadGame(appId) { p -> latest = p }
+                val dir = SteamRepository.get(applicationContext).downloadGame(appId, platform) { p -> latest = p }
                 finished = true
                 _status.value = DownloadStatus.Finished(appId, dir.absolutePath)
                 postResult("Selesai: $name")
@@ -278,6 +279,7 @@ class DownloadService : Service() {
         const val ACTION_PAUSE = "com.example.steamgrab.PAUSE"
         const val EXTRA_APP_ID = "app_id"
         const val EXTRA_NAME = "name"
+        const val EXTRA_OS = "os"
 
         private const val CHANNEL_ID = "download"
         private const val NOTIF_ID = 1

@@ -100,6 +100,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     val sizesLoading by vm.sizesLoading.collectAsState()
     val prices by vm.prices.collectAsState()
     val storageAlert by vm.storageAlert.collectAsState()
+    val platformChoice by vm.platformChoice.collectAsState()
 
     // Notifikasi dibutuhkan agar progres download terlihat di Android 13 ke atas
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -188,6 +189,47 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         is UiState.Error -> ErrorScreen(
             message = s.message,
             onBack = { vm.backToList() }
+        )
+    }
+
+    // Popup pilih versi. Hanya versi yang tersedia untuk game itu yang muncul sebagai pilihan.
+    platformChoice?.let { choice ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissPlatformChoice() },
+            title = { Text("Pilih versi untuk diunduh") },
+            text = {
+                Column {
+                    Text(choice.gameName, style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(12.dp))
+                    choice.options.forEach { option ->
+                        OutlinedButton(
+                            onClick = { vm.choosePlatform(choice.appId, option.platform) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
+                                Text(option.platform.label, style = MaterialTheme.typography.titleSmall)
+                                option.size?.let {
+                                    Text(
+                                        "Unduh ${formatBytes(it.download)} · Disk ${formatBytes(it.disk)}",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    if (choice.options.any { it.platform != Platform.WINDOWS }) {
+                        Text(
+                            "Catatan untuk macOS dan Linux: izin file (executable) dan symlink tidak bisa disimpan " +
+                                "di penyimpanan ponsel. Setelah dipindah ke Mac atau PC Linux, jalankan Verify " +
+                                "integrity di Steam kalau game tidak mau berjalan.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { vm.dismissPlatformChoice() }) { Text("Batal") } }
         )
     }
 
@@ -593,6 +635,7 @@ fun DownloadScreen(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
+            Text("Versi ${state.platform.label}", style = MaterialTheme.typography.bodySmall)
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.Bottom) {
                 Text("$pct%", style = MaterialTheme.typography.headlineMedium)

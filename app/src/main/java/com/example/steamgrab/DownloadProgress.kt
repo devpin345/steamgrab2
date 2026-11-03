@@ -1,5 +1,7 @@
 package com.example.steamgrab
 
+import android.net.TrafficStats
+import android.os.Process
 import java.io.File
 import java.util.Locale
 
@@ -57,6 +59,69 @@ class SpeedMeter {
 }
 
 /**
+ * Kecepatan jaringan per detik untuk candle. Sumber utama: byte masuk milik aplikasi ini dari TrafficStats, yang
+ * dihitung sistem Android per paket, jadi alirannya halus dan setara dengan yang ditunjukkan aplikasi monitor jaringan.
+ *
+ * Hitungan library sengaja bukan sumber utama: library baru menghitung sebuah chunk setelah chunk itu selesai
+ * diunduh, didekompresi, dan ditulis. Beberapa chunk yang diunduh paralel selesai hampir bersamaan, sehingga
+ * hasilnya lonjakan tiap beberapa detik dengan nol di antaranya, padahal jaringan terus mengalir. Hitungan library
+ * dipakai hanya kalau TrafficStats tidak didukung atau tidak bergerak.
+ */
+class NetworkMeter {
+    private val meter = SpeedMeter()
+    private var useTraffic = false
+    private var lastRx = 0L
+    private var lastLibrary = 0L
+    private var stuckTicks = 0
+
+    val speedBps: Long
+        get() = meter.speedBps
+
+    /** Sumber yang dipakai, untuk dicatat di log. */
+    val sourceName: String
+        get() = if (useTraffic) "TrafficStats (byte masuk aplikasi)" else "hitungan library"
+
+    fun start(nowMs: Long) {
+        val rx = readRx()
+        useTraffic = rx >= 0L
+        lastRx = rx
+        lastLibrary = 0L
+        stuckTicks = 0
+        meter.start(if (useTraffic) rx else 0L, nowMs)
+    }
+
+    fun sample(libraryBytes: Long, nowMs: Long) {
+        if (useTraffic) {
+            val rx = readRx()
+            if (rx >= 0L) {
+                // Angka sistem tidak bergerak padahal library melaporkan data masuk: perangkat ini tidak
+                // menyediakannya dengan benar, jadi beralih ke hitungan library.
+                if (rx == lastRx && libraryBytes > lastLibrary) stuckTicks++ else if (rx != lastRx) stuckTicks = 0
+                lastRx = rx
+            }
+            lastLibrary = libraryBytes
+            if (stuckTicks >= STUCK_LIMIT) {
+                useTraffic = false
+                meter.start(libraryBytes, nowMs)
+                return
+            }
+            meter.sample(lastRx, nowMs)
+        } else {
+            meter.sample(libraryBytes, nowMs)
+        }
+    }
+
+    fun history(): List<Long> = meter.history()
+
+    // -1 (UNSUPPORTED) kalau perangkat tidak menyediakan statistik per aplikasi
+    private fun readRx(): Long = TrafficStats.getUidRxBytes(Process.myUid())
+
+    private companion object {
+        const val STUCK_LIMIT = 8
+    }
+}
+
+/**
  * Kecepatan tulis ke penyimpanan per detik, beserta riwayatnya untuk garis di grafik.
  * Sumber utama adalah wchar di /proc/self/io: jumlah byte yang diserahkan aplikasi ke sistem lewat write(),
  * termasuk semua penulisan file game. Kalau file itu tidak bisa dibaca di perangkat ini, dipakai hitungan library
@@ -68,6 +133,8 @@ class DiskMeter {
     private var lastMs = 0L
     private val samples = ArrayDeque<Long>()
 
+    // Kecepatan yang ditampilkan: rata-rata beberapa detik terakhir. Library baru menulis sebuah chunk setelah seluruhnya
+    // terunduh, dan beberapa chunk selesai bersamaan, jadi tulisan per detik berupa lonjakan dengan nol di antaranya.
     var speedBps: Long = 0L
         private set
 
@@ -88,14 +155,24 @@ class DiskMeter {
         val elapsed = nowMs - lastMs
         if (elapsed <= 0L) return
         val current = if (useProc) readWriteChars() ?: lastBytes else libraryBytes
-        speedBps = (current - lastBytes).coerceAtLeast(0L) * 1000L / elapsed
-        samples.addLast(speedBps)
+        samples.addLast((current - lastBytes).coerceAtLeast(0L) * 1000L / elapsed)
         while (samples.size > SPEED_HISTORY_SIZE) samples.removeFirst()
+        speedBps = samples.toList().takeLast(SMOOTH_SECONDS).average().toLong()
         lastBytes = current
         lastMs = nowMs
     }
 
-    fun history(): List<Long> = samples.toList()
+    /** Riwayat untuk garis: tiap titik adalah rata-rata [SMOOTH_SECONDS] detik sampai detik itu. */
+    fun history(): List<Long> {
+        val raw = samples.toList()
+        return raw.indices.map { i ->
+            raw.subList(maxOf(0, i - SMOOTH_SECONDS + 1), i + 1).average().toLong()
+        }
+    }
+
+    private companion object {
+        const val SMOOTH_SECONDS = 5
+    }
 
     private fun readWriteChars(): Long? = try {
         File("/proc/self/io").useLines { lines ->
