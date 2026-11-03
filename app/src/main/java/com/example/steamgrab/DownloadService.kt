@@ -34,6 +34,9 @@ sealed class DownloadStatus {
         val progress: DownloadProgress,
         val speedBps: Long,
         val speedHistory: List<Long>,
+        // Kecepatan tulis ke penyimpanan, untuk garis di grafik
+        val diskBps: Long = 0L,
+        val diskHistory: List<Long> = emptyList(),
     ) : DownloadStatus()
     data class Paused(val appId: Int, val name: String, val progress: DownloadProgress) : DownloadStatus()
     data class Finished(val appId: Int, val path: String) : DownloadStatus()
@@ -64,6 +67,7 @@ class DownloadService : Service() {
     @Volatile private var latest = DownloadProgress()
     @Volatile private var largeIcon: Bitmap? = null
     private val meter = SpeedMeter()
+    private val disk = DiskMeter()
 
     override fun onCreate() {
         super.onCreate()
@@ -108,7 +112,10 @@ class DownloadService : Service() {
         currentName = name
         latest = DownloadProgress()
         largeIcon = null
-        meter.start(0L, System.currentTimeMillis())
+        val startMs = System.currentTimeMillis()
+        meter.start(0L, startMs)
+        disk.start(0L, startMs)
+        DebugLog.log("Kecepatan tulis disk diukur dari ${disk.sourceName}")
         publish(gen)
 
         job = scope.launch {
@@ -117,7 +124,9 @@ class DownloadService : Service() {
                 while (isActive) {
                     delay(TICK_MS)
                     // runBytes, bukan doneBytes: doneBytes ikut menghitung sesi sebelumnya dan bisa melompat
-                    meter.sample(latest.runBytes, System.currentTimeMillis())
+                    val now = System.currentTimeMillis()
+                    meter.sample(latest.runBytes, now)
+                    disk.sample(latest.writtenBytes, now)
                     publish(gen)
                 }
             }
@@ -175,7 +184,9 @@ class DownloadService : Service() {
         if (gen != generation || finished) return
         val p = latest
         val speed = meter.speedBps
-        _status.value = DownloadStatus.Running(currentAppId, currentName, p, speed, meter.history())
+        _status.value = DownloadStatus.Running(
+            currentAppId, currentName, p, speed, meter.history(), disk.speedBps, disk.history()
+        )
         getSystemService(NotificationManager::class.java)
             .notify(NOTIF_ID, buildNotification(currentName, p, speed))
     }

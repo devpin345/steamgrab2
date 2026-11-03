@@ -38,6 +38,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
@@ -55,7 +56,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
-import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -562,7 +562,14 @@ fun DownloadScreen(
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         // Gambar latar game tanpa judul, dengan candle kecepatan di atasnya
-        DownloadBackdrop(appId = state.appId, speedSamples = state.speedHistory)
+        DownloadBackdrop(
+            appId = state.appId,
+            networkSamples = state.speedHistory,
+            diskSamples = state.diskHistory,
+            networkBps = state.speedBps,
+            diskBps = state.diskBps,
+            showLegend = !state.paused,
+        )
 
         // Bar progres tipis tepat di bawah gambar
         Box(
@@ -602,7 +609,7 @@ fun DownloadScreen(
             Text(statusLine, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(16.dp))
 
-            ActivityPanel(paused = state.paused)
+            ActivityPanel(paused = state.paused, progress = p, speedHistory = state.speedHistory)
             Spacer(Modifier.height(16.dp))
 
             if (!state.paused) {
@@ -630,24 +637,36 @@ fun DownloadScreen(
 /** Jumlah baris catatan yang ditampilkan di panel detail, terbaru di atas. */
 private const val ACTIVITY_LINES_SHOWN = 80
 
+/** Berapa detik terakhir yang dirata-ratakan untuk estimasi sisa waktu. */
+private const val ETA_WINDOW_SECONDS = 20
+
+/**
+ * Estimasi sisa waktu: sisa byte dibagi rata-rata kecepatan jaringan beberapa detik terakhir. Hanya perkiraan,
+ * karena kecepatan berubah-ubah dan ada pekerjaan penutup (merapikan folder) setelah byte terakhir masuk.
+ */
+private fun estimateText(p: DownloadProgress, speedHistory: List<Long>): String {
+    if (p.finishing) return "Estimasi: tinggal merapikan folder"
+    if (p.totalBytes <= 0L) return "Estimasi: menghitung..."
+    val remaining = (p.totalBytes - p.doneBytes).coerceAtLeast(0L)
+    // Dihitung mulai dari detik pertama yang ada datanya, supaya detik-detik awal tanpa data (pemeriksaan file)
+    // tidak menggelembungkan estimasi
+    val window = speedHistory.takeLast(ETA_WINDOW_SECONDS).dropWhile { it == 0L }
+    val average = if (window.isEmpty()) 0L else window.sum() / window.size
+    if (average < 1024L) return "Estimasi: menunggu data masuk..."
+    return "Estimasi sisa waktu: sekitar ${formatDuration(remaining / average)} (sisa ${formatBytes(remaining)})"
+}
+
 /**
  * Panel kegiatan: satu baris tentang yang sedang dikerjakan, dan tombol untuk membuka catatan lengkap berjam
  * beserta hitungan file. Beberapa tahap berjalan bersamaan, jadi baris ini mengikuti kejadian terbaru.
  */
 @Composable
-private fun ActivityPanel(paused: Boolean) {
+private fun ActivityPanel(paused: Boolean, progress: DownloadProgress, speedHistory: List<Long>) {
     val current by DownloadActivity.now.collectAsState()
     val entries by DownloadActivity.entries.collectAsState()
     val stats by DownloadActivity.stats.collectAsState()
     var expanded by remember { mutableStateOf(false) }
 
-    // Detik berjalan, supaya "berjalan ..." tetap bergerak walau belum ada kejadian baru
-    val nowMs by produceState(initialValue = System.currentTimeMillis()) {
-        while (true) {
-            delay(1000L)
-            value = System.currentTimeMillis()
-        }
-    }
     val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
     Surface(
@@ -667,11 +686,8 @@ private fun ActivityPanel(paused: Boolean) {
                 maxLines = if (expanded) 5 else 2,
                 overflow = TextOverflow.Ellipsis
             )
-            if (!paused && current.sinceMs > 0L) {
-                Text(
-                    "Langkah ini berjalan ${formatElapsed((nowMs - current.sinceMs) / 1000L)}",
-                    style = MaterialTheme.typography.bodySmall
-                )
+            if (!paused) {
+                Text(estimateText(progress, speedHistory), style = MaterialTheme.typography.bodySmall)
             }
             TextButton(
                 onClick = { expanded = !expanded },
@@ -729,11 +745,18 @@ private fun ActivityPanel(paused: Boolean) {
 }
 
 /**
- * Gambar latar game (tanpa judul) dengan candle kecepatan di bagian bawahnya. Selama gambar belum siap
- * atau game tidak punya gambar latar, yang tampil warna polos.
+ * Gambar latar game (tanpa judul) dengan grafik di bagian bawahnya: candle kecepatan jaringan dan garis kecepatan
+ * tulis ke disk yang saling menimpa. Selama gambar belum siap atau game tidak punya gambar latar, yang tampil warna polos.
  */
 @Composable
-private fun DownloadBackdrop(appId: Int, speedSamples: List<Long>) {
+private fun DownloadBackdrop(
+    appId: Int,
+    networkSamples: List<Long>,
+    diskSamples: List<Long>,
+    networkBps: Long,
+    diskBps: Long,
+    showLegend: Boolean,
+) {
     val hero by produceState<Bitmap?>(initialValue = GameImages.cachedHero(appId), key1 = appId) {
         value = GameImages.loadHero(appId)
     }
@@ -753,39 +776,101 @@ private fun DownloadBackdrop(appId: Int, speedSamples: List<Long>) {
                 modifier = Modifier.matchParentSize()
             )
         }
-        // Bayangan tipis di bagian bawah supaya candle tetap terbaca di gambar yang terang
+        // Bayangan tipis di atas dan bawah supaya keterangan dan candle tetap terbaca di gambar yang terang
         Box(
             Modifier
                 .matchParentSize()
-                .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.35f))))
+                .background(
+                    Brush.verticalGradient(
+                        0f to Color.Black.copy(alpha = 0.35f),
+                        0.3f to Color.Transparent,
+                        0.6f to Color.Transparent,
+                        1f to Color.Black.copy(alpha = 0.35f)
+                    )
+                )
         )
-        SpeedCandles(
-            samples = speedSamples,
+        SpeedChart(
+            network = networkSamples,
+            disk = diskSamples,
             modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(110.dp)
         )
+        if (showLegend) {
+            Column(
+                Modifier.align(Alignment.TopEnd).padding(10.dp),
+                horizontalAlignment = Alignment.End
+            ) {
+                LegendItem("Jaringan ${formatSpeed(networkBps)}") {
+                    Box(Modifier.size(width = 6.dp, height = 10.dp).background(CANDLE_COLOR))
+                }
+                Spacer(Modifier.height(2.dp))
+                LegendItem("Tulis ke disk ${formatSpeed(diskBps)}") {
+                    Box(Modifier.size(width = 14.dp, height = 2.dp).background(DISK_LINE_COLOR))
+                }
+            }
+        }
+    }
+}
+
+// Candle jaringan: putih dengan opasitas 45%. Garis disk: biru muda, supaya tampak di atas candle putih.
+private val CANDLE_COLOR = Color.White.copy(alpha = 0.45f)
+private val DISK_LINE_COLOR = Color(0xFF66C0F4)
+
+/** Satu baris keterangan grafik: penanda warna lalu teks, dengan bayangan supaya terbaca di atas gambar. */
+@Composable
+private fun LegendItem(text: String, swatch: @Composable () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall.copy(
+                color = Color.White,
+                shadow = Shadow(Color.Black.copy(alpha = 0.7f), blurRadius = 4f)
+            )
+        )
+        Spacer(Modifier.width(6.dp))
+        swatch()
     }
 }
 
 /**
- * Candle kecepatan: satu batang per detik, terbaru di kanan. Jarak antar batang sama dengan lebar batang,
- * jadi bentuknya "l l l", bukan "lll". Putih dengan opasitas 45%, skala mengikuti nilai tertinggi.
+ * Grafik kecepatan: satu candle per detik untuk jaringan (terbaru di kanan, jarak antar batang sama dengan lebar
+ * batang, jadi "l l l" bukan "lll"), dan di atasnya satu garis untuk kecepatan tulis ke disk. Keduanya memakai
+ * skala yang sama, jadi terlihat langsung kalau disk tertinggal dari jaringan.
  */
 @Composable
-fun SpeedCandles(samples: List<Long>, modifier: Modifier = Modifier) {
+fun SpeedChart(network: List<Long>, disk: List<Long>, modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
-        if (samples.isEmpty()) return@Canvas
+        if (network.isEmpty() && disk.isEmpty()) return@Canvas
 
-        val peak = (samples.maxOrNull() ?: 0L).coerceAtLeast(1L).toFloat()
+        val peak = maxOf(network.maxOrNull() ?: 0L, disk.maxOrNull() ?: 0L, 1L).toFloat()
         // Batang dan celah sama lebar: 60 batang dan 59 celah berarti 119 satuan lebar
         val unit = size.width / (2 * SPEED_HISTORY_SIZE - 1)
         val minHeight = 2.dp.toPx()
-        val color = Color.White.copy(alpha = 0.45f)
-        val firstSlot = SPEED_HISTORY_SIZE - samples.size
 
-        samples.forEachIndexed { i, v ->
+        val networkFirst = SPEED_HISTORY_SIZE - network.size
+        network.forEachIndexed { i, v ->
             val h = (v / peak * size.height).coerceAtLeast(minHeight)
-            val x = (firstSlot + i) * 2 * unit
-            drawRect(color = color, topLeft = Offset(x, size.height - h), size = Size(unit, h))
+            val x = (networkFirst + i) * 2 * unit
+            drawRect(color = CANDLE_COLOR, topLeft = Offset(x, size.height - h), size = Size(unit, h))
+        }
+
+        if (disk.isNotEmpty()) {
+            val diskFirst = SPEED_HISTORY_SIZE - disk.size
+            // Titik garis ada di tengah batang candle pada detik yang sama
+            fun xAt(i: Int) = (diskFirst + i) * 2 * unit + unit / 2f
+            fun yAt(v: Long) = size.height - (v / peak * size.height).coerceIn(0f, size.height)
+
+            val line = Path()
+            disk.forEachIndexed { i, v ->
+                if (i == 0) line.moveTo(xAt(i), yAt(v)) else line.lineTo(xAt(i), yAt(v))
+            }
+            drawPath(
+                path = line,
+                color = DISK_LINE_COLOR,
+                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
+            )
+            if (disk.size == 1) {
+                drawCircle(color = DISK_LINE_COLOR, radius = 2.dp.toPx(), center = Offset(xAt(0), yAt(disk[0])))
+            }
         }
     }
 }

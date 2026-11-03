@@ -8,8 +8,8 @@ import kotlinx.coroutines.flow.update
 /** Satu baris catatan kegiatan, lengkap dengan jam kejadiannya. */
 data class ActivityEntry(val timeMs: Long, val text: String)
 
-/** Kegiatan yang sedang berjalan. [sinceMs] adalah kapan langkah ini dimulai, untuk menampilkan sudah berapa lama. */
-data class ActivityNow(val text: String = "", val sinceMs: Long = 0L)
+/** Kegiatan yang sedang berjalan, dalam satu baris teks. */
+data class ActivityNow(val text: String = "")
 
 /** Hitungan kegiatan library. Beberapa tahap berjalan bersamaan, jadi angka-angka ini naik bersamaan juga. */
 data class ActivityStats(
@@ -49,17 +49,14 @@ object DownloadActivity {
      * Dipakai untuk kejadian yang jumlahnya sedikit, bukan untuk tiap file.
      */
     fun step(text: String) {
-        val t = System.currentTimeMillis()
-        _now.value = ActivityNow(text, t)
-        _entries.update { (it + ActivityEntry(t, text)).takeLast(MAX_ENTRIES) }
+        _now.value = ActivityNow(text)
+        _entries.update { (it + ActivityEntry(System.currentTimeMillis(), text)).takeLast(MAX_ENTRIES) }
         DebugLog.log("Aktivitas: $text")
     }
 
     /** Mengganti teks kegiatan saat ini tanpa masuk catatan (misalnya nama file yang sedang diperiksa). */
     fun detail(text: String) {
-        _now.update {
-            if (it.text == text) it else ActivityNow(text, if (it.sinceMs == 0L) System.currentTimeMillis() else it.sinceMs)
-        }
+        _now.update { if (it.text == text) it else ActivityNow(text) }
     }
 
     fun setDepotsTotal(total: Int) {
@@ -88,10 +85,4 @@ fun shortFileName(path: String): String {
     val clean = path.replace('\\', '/').trimEnd('/')
     val parts = clean.split('/')
     return if (parts.size <= 2) clean else ".../" + parts.takeLast(2).joinToString("/")
-}
-
-/** Contoh: 75 -> "1m 15d", 8 -> "8d". */
-fun formatElapsed(seconds: Long): String {
-    val s = seconds.coerceAtLeast(0L)
-    return if (s < 60L) "${s}d" else "${s / 60L}m ${s % 60L}d"
 }

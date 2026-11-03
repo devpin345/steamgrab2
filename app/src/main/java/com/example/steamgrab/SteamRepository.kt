@@ -6,7 +6,9 @@ import `in`.dragonbra.javasteam.depotdownloader.IDownloadListener
 import `in`.dragonbra.javasteam.depotdownloader.data.AppItem
 import `in`.dragonbra.javasteam.depotdownloader.data.DownloadItem
 import `in`.dragonbra.javasteam.enums.EResult
+import `in`.dragonbra.javasteam.steam.authentication.AuthPollResult
 import `in`.dragonbra.javasteam.steam.authentication.AuthSessionDetails
+import `in`.dragonbra.javasteam.steam.authentication.AuthenticationException
 import `in`.dragonbra.javasteam.steam.authentication.IAuthenticator
 import `in`.dragonbra.javasteam.steam.authentication.CredentialsAuthSession
 import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesAuthSteamclient.EAuthSessionGuardType
@@ -42,6 +44,7 @@ import `in`.dragonbra.javasteam.steam.handlers.steamcontent.SteamContent
 import `in`.dragonbra.javasteam.steam.steamclient.AsyncJobFailedException
 import `in`.dragonbra.javasteam.types.KeyValue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -92,9 +95,18 @@ class SteamRepository private constructor(context: Context) {
     private var pendingPass: String? = null
     private var onGuardNeeded: ((GuardType, Boolean) -> Unit)? = null
     @Volatile private var pendingGuard: CompletableFuture<String>? = null
-    // Sesi login yang sedang menunggu persetujuan di Steam Mobile. Kode juga bisa dikirim langsung ke sesi ini.
+    // Sesi login yang sudah dibuat di Steam dan belum selesai (menunggu persetujuan di Steam Mobile atau kode).
+    // Kode juga bisa dikirim langsung ke sesi ini. Sesi ini DIPERTAHANKAN saat koneksi putus, misalnya ketika pengguna
+    // berpindah ke aplikasi Steam Mobile untuk menyetujui. Setelah tersambung lagi, sesi yang sama dilanjutkan.
+    // Membuat sesi baru akan mengirim permintaan persetujuan baru ke Steam Mobile (dan email kode baru).
     @Volatile private var activeSession: CredentialsAuthSession? = null
     @Volatile private var awaitingApproval = false
+    // Nomor percobaan login. Naik setiap login baru dari tombol Login, sehingga sesi dan loop tunggu milik percobaan
+    // lama berhenti sendiri. Sambung ulang otomatis tidak menaikkannya, jadi sesi yang sama dilanjutkan.
+    private val authGeneration = AtomicInteger(0)
+    private val authLock = Any()
+    // Nomor percobaan yang sedang menjalankan loop tunggu persetujuan, -1 kalau tidak ada
+    private var authRunningGen = -1
     @Volatile private var connected = false
     // True dari balasan logOn OK sampai koneksi putus lagi. Dipakai untuk menunggu sesi pulih setelah sambung ulang.
     @Volatile private var sessionActive = false
@@ -124,11 +136,11 @@ class SteamRepository private constructor(context: Context) {
             DebugLog.log("Koneksi ke Steam terputus (dibatalkan pengguna: ${cb.isUserInitiated})")
             if (!cb.isUserInitiated) {
                 connecting = false
-                // Kode yang sedang ditunggu ikut batal. Setelah tersambung, Steam akan meminta kode lagi.
+                // Kode yang sedang ditunggu ikut batal. Setelah tersambung, kode diminta lagi dari sesi yang sama.
+                // activeSession dan awaitingApproval sengaja dipertahankan: loop tunggu melanjutkan sesi itu,
+                // bukan membuat sesi baru yang memunculkan permintaan persetujuan kedua di Steam Mobile.
                 pendingGuard?.cancel(false)
                 pendingGuard = null
-                awaitingApproval = false
-                activeSession = null
                 onStatus?.invoke("Koneksi ke Steam terputus, menyambung ulang...")
                 scope.launch {
                     delay(2000L)
@@ -170,6 +182,14 @@ class SteamRepository private constructor(context: Context) {
         onGuardCodeNeeded: (GuardType, Boolean) -> Unit,
         onStatus: (String) -> Unit = {},
     ) {
+        // Login baru dari tombol Login: sisa sesi dari percobaan sebelumnya dibuang. Hanya sambung ulang otomatis
+        // yang melanjutkan sesi lama.
+        authGeneration.incrementAndGet()
+        activeSession = null
+        awaitingApproval = false
+        pendingGuard?.cancel(false)
+        pendingGuard = null
+
         pendingUser = username
         pendingPass = password
         onGuardNeeded = onGuardCodeNeeded
@@ -423,6 +443,7 @@ class SteamRepository private constructor(context: Context) {
                         phase = phase.get(),
                         runBytes = s.thisRun.toLong(),
                         finishing = finishing,
+                        writtenBytes = s.written.toLong(),
                     )
                 )
             }
@@ -683,14 +704,16 @@ class SteamRepository private constructor(context: Context) {
         depotDisk: Map<Int, Long>,
     ): Summary {
         var thisRun = 0.0
+        var written = 0.0
         var estimatedTotal = 0.0
         for (d in depots.values) {
             thisRun += d.compressed
+            written += d.uncompressed
             if (d.percent > 0f) estimatedTotal += d.compressed / d.percent.toDouble()
         }
         // Kalau ukuran dari manifest sudah diketahui, pakai itu. Lebih akurat daripada perkiraan dari persen.
         val total = if (knownTotal != null && knownTotal > 0L) knownTotal.toDouble() else estimatedTotal
-        if (total <= 0.0) return Summary(fraction = 0.0, total = 0.0, thisRun = thisRun, exact = false)
+        if (total <= 0.0) return Summary(fraction = 0.0, total = 0.0, thisRun = thisRun, written = written, exact = false)
 
         // Sesi sebelumnya ditambah yang masuk sekarang. Library hanya mengunduh chunk yang belum ada,
         // jadi byte yang dilaporkannya hanya dari sesi ini.
@@ -699,7 +722,7 @@ class SteamRepository private constructor(context: Context) {
         // Persen dari library ikut menghitung data yang sudah ada di folder, jadi lebih benar untuk folder yang
         // sudah terisi (misalnya dari sebelum ada catatan di appmanifest).
         val diskTotal = depotDisk.values.sum()
-        if (diskTotal <= 0L) return Summary(fraction = byBytes, total = total, thisRun = thisRun, exact = false)
+        if (diskTotal <= 0L) return Summary(fraction = byBytes, total = total, thisRun = thisRun, written = written, exact = false)
 
         var weighted = 0.0
         for ((depotId, disk) in depotDisk) {
@@ -711,14 +734,20 @@ class SteamRepository private constructor(context: Context) {
         // kalau perkiraan dari byte terkompresi terlalu tinggi (ukuran unduhan dari info app bisa meleset).
         val allReported = depotDisk.keys.all { depots.containsKey(it) }
         return if (allReported) {
-            Summary(fraction = byLibrary, total = total, thisRun = thisRun, exact = true)
+            Summary(fraction = byLibrary, total = total, thisRun = thisRun, written = written, exact = true)
         } else {
-            Summary(fraction = maxOf(byBytes, byLibrary), total = total, thisRun = thisRun, exact = false)
+            Summary(fraction = maxOf(byBytes, byLibrary), total = total, thisRun = thisRun, written = written, exact = false)
         }
     }
 
     /** Hasil penggabungan progres: [fraction] 0..1 dari [total] byte, [thisRun] byte terkompresi yang masuk sesi ini. */
-    private class Summary(val fraction: Double, val total: Double, val thisRun: Double, val exact: Boolean)
+    private class Summary(
+        val fraction: Double,
+        val total: Double,
+        val thisRun: Double,
+        val written: Double,
+        val exact: Boolean,
+    )
 
     /** Dipanggil tiap ada data yang masuk. Mengumumkan tahap data satu kali dan menjaga baris kegiatan saat ini. */
     private fun markDataActivity(announced: MutableSet<String>) {
@@ -771,6 +800,7 @@ class SteamRepository private constructor(context: Context) {
     }
 
     private suspend fun startSession() {
+        val gen = authGeneration.get()
         try {
             val storedAccount = prefs.getString(KEY_ACCOUNT, null)
             val storedToken = prefs.getString(KEY_TOKEN, null)
@@ -783,39 +813,59 @@ class SteamRepository private constructor(context: Context) {
                 return
             }
 
-            val user = typedUser ?: error("Silakan login ulang")
-            val pass = pendingPass ?: error("Silakan login ulang")
-
-            val result = withContext(Dispatchers.IO) {
-                val details = AuthSessionDetails().apply {
-                    username = user
-                    password = pass
-                    deviceFriendlyName = "SteamGrab Android"
-                    persistentSession = true
-                    authenticator = guardAuthenticator
+            // Satu loop login per percobaan. Panggilan kedua (misalnya dari ConnectedCallback saat loop yang sama
+            // masih menunggu sambungan pulih) tidak boleh membuat sesi baru.
+            synchronized(authLock) {
+                if (authRunningGen == gen) {
+                    DebugLog.log("Login masih berjalan, tidak membuat sesi baru")
+                    return
                 }
-                DebugLog.log("Mengirim login kredensial ke Steam...")
-                val session = client.authentication.beginAuthSessionViaCredentials(details).get()
-                DebugLog.log("Sesi login dibuat, menunggu verifikasi...")
-                activeSession = session
-                try {
-                    val poll = session.pollingWaitForResult().get()
-                    DebugLog.log("Verifikasi selesai, token diterima")
-                    poll
-                } finally {
-                    awaitingApproval = false
-                    activeSession = null
-                }
+                authRunningGen = gen
             }
+            try {
+                val existing = activeSession
+                val session = if (existing != null) {
+                    DebugLog.log("Melanjutkan sesi login yang sama setelah tersambung lagi (tanpa permintaan baru)")
+                    existing
+                } else {
+                    val user = typedUser ?: error("Silakan login ulang")
+                    val pass = pendingPass ?: error("Silakan login ulang")
+                    val created = withContext(Dispatchers.IO) {
+                        val details = AuthSessionDetails().apply {
+                            username = user
+                            password = pass
+                            deviceFriendlyName = "SteamGrab Android"
+                            persistentSession = true
+                            authenticator = guardAuthenticator
+                        }
+                        DebugLog.log("Mengirim login kredensial ke Steam...")
+                        client.authentication.beginAuthSessionViaCredentials(details).get()
+                    }
+                    DebugLog.log("Sesi login dibuat, menunggu verifikasi...")
+                    if (gen != authGeneration.get()) throw StaleLoginException()
+                    activeSession = created
+                    created
+                }
 
-            prefs.edit()
-                .putString(KEY_ACCOUNT, result.accountName)
-                .putString(KEY_TOKEN, result.refreshToken)
-                .apply()
-            logOn(result.accountName, result.refreshToken)
+                val result = awaitAuthResult(session, gen)
+                if (gen != authGeneration.get()) throw StaleLoginException()
+                DebugLog.log("Verifikasi selesai, token diterima")
+
+                awaitingApproval = false
+                activeSession = null
+                prefs.edit()
+                    .putString(KEY_ACCOUNT, result.accountName)
+                    .putString(KEY_TOKEN, result.refreshToken)
+                    .apply()
+                logOn(result.accountName, result.refreshToken)
+            } finally {
+                synchronized(authLock) { if (authRunningGen == gen) authRunningGen = -1 }
+            }
+        } catch (e: StaleLoginException) {
+            DebugLog.log("Login lama dihentikan karena login baru dimulai")
         } catch (e: java.util.concurrent.CancellationException) {
-            // Koneksi putus di tengah login membatalkan permintaan ke Steam. Login dimulai ulang
-            // otomatis saat tersambung lagi, jadi error tidak ditampilkan dulu.
+            // Koneksi putus saat membuat sesi membatalkan permintaan ke Steam. Dicoba lagi otomatis
+            // saat tersambung kembali, jadi error tidak ditampilkan dulu.
             DebugLog.log("Login terhenti karena koneksi putus, menunggu sambung ulang")
         } catch (e: Exception) {
             if (!connected || e.isConnectionLoss()) {
@@ -825,9 +875,91 @@ class SteamRepository private constructor(context: Context) {
                 return
             }
             DebugLog.log("ERROR di startSession: ${e.describe()}")
-            loggedOn.completeExceptionally(e)
+            if (gen == authGeneration.get()) {
+                // Gagal sungguhan (bukan koneksi): sesi ini tidak bisa dilanjutkan lagi
+                activeSession = null
+                awaitingApproval = false
+                val shown: Throwable = if (e.authRejection()?.result == EResult.Expired) {
+                    IllegalStateException(
+                        "Permintaan persetujuan di Steam Mobile sudah kedaluwarsa. Tekan Login untuk meminta yang baru.",
+                        e
+                    )
+                } else {
+                    e
+                }
+                loggedOn.completeExceptionally(shown)
+            }
         }
     }
+
+    /**
+     * Menunggu sesi login disetujui (di Steam Mobile atau dengan kode). Koneksi yang putus di tengah jalan tidak
+     * mengakhiri penantian: loop menunggu sambungan pulih lalu memeriksa sesi yang sama lagi. Pengguna bisa berpindah
+     * ke aplikasi Steam Mobile dan kembali tanpa membuat permintaan persetujuan baru.
+     */
+    private suspend fun awaitAuthResult(session: CredentialsAuthSession, gen: Int): AuthPollResult {
+        val byApproval = session.allowedConfirmations.firstOrNull()?.confirmationType ==
+            EAuthSessionGuardType.k_EAuthSessionGuardType_DeviceConfirmation
+        var transientFailures = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            if (gen != authGeneration.get()) throw StaleLoginException()
+            if (!client.isConnected) {
+                delay(500L)
+                continue
+            }
+            try {
+                return if (byApproval) {
+                    pollForApproval(session, gen)
+                } else {
+                    // Kode dari authenticator atau email: library yang mengurus, dan meminta kode lewat guardAuthenticator
+                    withContext(Dispatchers.IO) { session.pollingWaitForResult().get() }
+                }
+            } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
+                if (e is StaleLoginException) throw e
+                if (e.isConnectionLoss()) {
+                    DebugLog.log("Koneksi putus saat menunggu persetujuan, sesi yang sama dilanjutkan setelah tersambung lagi")
+                    delay(1000L)
+                    continue
+                }
+                // Ditolak Steam (misalnya kedaluwarsa) tidak bisa dilanjutkan. Gangguan sesaat dicoba lagi beberapa kali.
+                if (e.authRejection() != null || ++transientFailures > MAX_POLL_FAILURES) throw e
+                DebugLog.log("Gangguan sesaat saat menunggu persetujuan ($transientFailures): ${e.describe()}")
+                delay(2000L)
+            }
+        }
+    }
+
+    /**
+     * Memeriksa sesi secara berkala sampai disetujui di Steam Mobile. Dipakai menggantikan penantian bawaan library:
+     * di JavaSteam 1.8.0 interval dari Steam (dalam detik) dibaca sebagai milidetik, sehingga permintaan dikirim
+     * beruntun tanpa jeda berarti. Di sini jedanya mengikuti interval dari Steam.
+     */
+    private suspend fun pollForApproval(session: CredentialsAuthSession, gen: Int): AuthPollResult {
+        awaitingApproval = true
+        DebugLog.log("Menunggu persetujuan di Steam Mobile")
+        // Dipanggil juga setiap kali penantian dilanjutkan, supaya layar kembali menampilkan petunjuk persetujuan
+        // setelah sebelumnya menampilkan "menyambung ulang".
+        onGuardNeeded?.invoke(GuardType.APPROVAL, false)
+        val intervalMs = (session.pollingInterval * 1000f).toLong().coerceIn(2_000L, 5_000L)
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            if (gen != authGeneration.get()) throw StaleLoginException()
+            val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).get() }
+            if (result != null) return result
+            delay(intervalMs)
+        }
+    }
+
+    /** Login lama berhenti karena pengguna sudah memulai login baru. Bukan error yang perlu ditampilkan. */
+    private class StaleLoginException : Exception("Login digantikan oleh percobaan baru")
+
+    /** Penolakan dari Steam (misalnya sesi kedaluwarsa) di dalam rantai penyebab, atau null kalau bukan itu. */
+    private fun Throwable.authRejection(): AuthenticationException? =
+        generateSequence(this) { it.cause?.takeIf { c -> c !== it } }
+            .filterIsInstance<AuthenticationException>()
+            .firstOrNull()
 
     private fun logOn(account: String, refreshToken: String) {
         val details = LogOnDetails().apply {
@@ -974,6 +1106,8 @@ class SteamRepository private constructor(context: Context) {
         private const val RECONNECT_WAIT_MS = 45_000L
         // Percobaan sambung yang tidak dijawab selama ini dianggap macet, jadi boleh dicoba lagi
         private const val CONNECT_STALE_MS = 30_000L
+        // Gangguan sesaat (bukan penolakan Steam) berturut-turut yang ditoleransi saat menunggu persetujuan
+        private const val MAX_POLL_FAILURES = 3
         // Persen yang ditampilkan tidak melewati ini sebelum download benar-benar selesai
         private const val MAX_FRACTION_BEFORE_DONE = 0.99
         private const val DATA_ACTIVITY = "Mengunduh, mendekompresi, dan menulis data game"

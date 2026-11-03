@@ -43,6 +43,8 @@ sealed class UiState {
         val speedBps: Long,
         val speedHistory: List<Long>,
         val paused: Boolean = false,
+        val diskBps: Long = 0L,
+        val diskHistory: List<Long> = emptyList(),
     ) : UiState()
 
     data class Done(val savedPath: String) : UiState()
@@ -361,7 +363,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun DownloadStatus.Running.toUi(): UiState.Downloading =
-        UiState.Downloading(appId, name, progress, speedBps, speedHistory)
+        UiState.Downloading(appId, name, progress, speedBps, speedHistory, diskBps = diskBps, diskHistory = diskHistory)
 
     private fun DownloadStatus.Paused.toUi(): UiState.Downloading =
         UiState.Downloading(appId, name, progress, 0L, emptyList(), paused = true)
