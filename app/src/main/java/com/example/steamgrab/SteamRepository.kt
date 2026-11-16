@@ -93,6 +93,14 @@ class SteamRepository private constructor(context: Context) {
     }
     private var pendingUser: String? = null
     private var pendingPass: String? = null
+    // "Remember me": kalau true, token login disimpan dan dipakai lagi (tanpa Steam Guard) untuk akun yang sama
+    @Volatile private var pendingRemember = true
+
+    /** Nama akun yang diingat dari login sebelumnya, untuk mengisi kolom Nickname. Null kalau tidak diingat. */
+    fun savedAccount(): String? = prefs.getString(KEY_ACCOUNT, null)
+
+    /** Pilihan "Remember me" terakhir. Awalnya true, sama seperti perilaku sebelum kotak itu ada. */
+    fun rememberChoice(): Boolean = prefs.getBoolean(KEY_REMEMBER, true)
     private var onGuardNeeded: ((GuardType, Boolean) -> Unit)? = null
     @Volatile private var pendingGuard: CompletableFuture<String>? = null
     // Sesi login yang sudah dibuat di Steam dan belum selesai (menunggu persetujuan di Steam Mobile atau kode).
@@ -181,10 +189,14 @@ class SteamRepository private constructor(context: Context) {
         password: String,
         onGuardCodeNeeded: (GuardType, Boolean) -> Unit,
         onStatus: (String) -> Unit = {},
+        remember: Boolean = true,
     ) {
         // Login baru dari tombol Login: sisa sesi dari percobaan sebelumnya dibuang. Hanya sambung ulang otomatis
         // yang melanjutkan sesi lama.
         authGeneration.incrementAndGet()
+        pendingRemember = remember
+        prefs.edit().putBoolean(KEY_REMEMBER, remember).apply()
+        if (!remember) prefs.edit().remove(KEY_TOKEN).remove(KEY_ACCOUNT).apply()
         activeSession = null
         awaitingApproval = false
         pendingGuard?.cancel(false)
@@ -273,6 +285,19 @@ class SteamRepository private constructor(context: Context) {
     /** True jika library sedang menunggu kode Steam Guard dari pengguna. */
     val isWaitingForGuard: Boolean
         get() = pendingGuard != null || awaitingApproval
+
+    /**
+     * Menghentikan percobaan login yang sedang menunggu (kembali dari layar Steam Guard, atau waktunya habis).
+     * Sesi dan loop tunggu milik percobaan itu berhenti sendiri, jadi persetujuan yang datang terlambat
+     * tidak menyelesaikan login di belakang layar.
+     */
+    fun abortLogin() {
+        authGeneration.incrementAndGet()
+        activeSession = null
+        awaitingApproval = false
+        pendingGuard?.cancel(false)
+        pendingGuard = null
+    }
 
     /** Mengembalikan true jika kode dipakai untuk pertanyaan Steam Guard yang sedang menunggu. */
     fun submitGuardCode(code: String?): Boolean {
@@ -869,7 +894,7 @@ class SteamRepository private constructor(context: Context) {
             val storedToken = prefs.getString(KEY_TOKEN, null)
             val typedUser = pendingUser
 
-            if (storedAccount != null && storedToken != null &&
+            if (pendingRemember && storedAccount != null && storedToken != null &&
                 (typedUser == null || typedUser.equals(storedAccount, ignoreCase = true))
             ) {
                 logOn(storedAccount, storedToken)
@@ -916,10 +941,13 @@ class SteamRepository private constructor(context: Context) {
 
                 awaitingApproval = false
                 activeSession = null
-                prefs.edit()
-                    .putString(KEY_ACCOUNT, result.accountName)
-                    .putString(KEY_TOKEN, result.refreshToken)
-                    .apply()
+                // Tanpa "Remember me", token hanya dipakai untuk sesi ini dan tidak disimpan di ponsel
+                if (pendingRemember) {
+                    prefs.edit()
+                        .putString(KEY_ACCOUNT, result.accountName)
+                        .putString(KEY_TOKEN, result.refreshToken)
+                        .apply()
+                }
                 logOn(result.accountName, result.refreshToken)
             } finally {
                 synchronized(authLock) { if (authRunningGen == gen) authRunningGen = -1 }
@@ -1165,6 +1193,7 @@ class SteamRepository private constructor(context: Context) {
     companion object {
         private const val KEY_ACCOUNT = "account"
         private const val KEY_TOKEN = "refresh_token"
+        private const val KEY_REMEMBER = "remember_me"
         private const val MAX_RECONNECT_RETRIES = 3
         private const val RECONNECT_WAIT_MS = 45_000L
         // Percobaan sambung yang tidak dijawab selama ini dianggap macet, jadi boleh dicoba lagi

@@ -5,12 +5,14 @@ import android.content.Intent
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -31,7 +33,15 @@ sealed class UiState {
         val loading: Boolean = false,
         val error: String? = null,
         val needsGuardCode: Boolean = false,
-        val status: String? = null
+        val status: String? = null,
+        // Kapan layar Steam Guard pertama muncul pada percobaan login ini (0 = belum). Dasar hitung mundur kirim ulang.
+        val guardSince: Long = 0L,
+        // Jenis verifikasi yang diminta Steam, untuk teks petunjuk di layar Steam Guard
+        val guardType: GuardType? = null,
+        // Kode yang baru dikirim ditolak Steam
+        val wrongCode: Boolean = false,
+        // Waktu menunggu habis, kode atau persetujuan baru harus diminta lewat tombol Kirim ulang
+        val guardExpired: Boolean = false,
     ) : UiState()
 
     data class GameList(val games: List<GameInfo>) : UiState()
@@ -81,6 +91,12 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     private var loginJob: Job? = null
     private var priceJob: Job? = null
 
+    // Kredensial login terakhir, hanya di memori. Dipakai tombol Kirim ulang di layar Steam Guard.
+    private var lastUser = ""
+    private var lastPass = ""
+    private var lastRemember = true
+    @Volatile private var guardSince = 0L
+
     init {
         GamePriceStore.init(app)
         PlatformStore.init(app)
@@ -90,15 +106,37 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun login(username: String, password: String, guardCode: String?) {
+    fun savedAccount(): String? = repo.savedAccount()
+
+    fun rememberChoice(): Boolean = repo.rememberChoice()
+
+    /** Keadaan layar Steam Guard. [guardSince] ikut dibawa supaya hitung mundur kirim ulang tidak mulai dari awal. */
+    private fun guardState(
+        loading: Boolean = false,
+        error: String? = null,
+        status: String? = null,
+        type: GuardType? = null,
+        wrongCode: Boolean = false,
+    ) = UiState.LoggedOut(
+        loading = loading,
+        error = error,
+        needsGuardCode = true,
+        status = status,
+        guardSince = guardSince,
+        guardType = type,
+        wrongCode = wrongCode,
+    )
+
+    fun login(username: String, password: String, guardCode: String?, remember: Boolean = true) {
         // Sedang menunggu kode Steam Guard: kirim kodenya ke sesi login yang sudah berjalan,
         // jangan memulai login baru.
         if (repo.isWaitingForGuard) {
-            DebugLog.log("Tombol Kirim kode ditekan")
+            DebugLog.log("Kode Steam Guard dikirim dari layar")
+            val type = (_uiState.value as? UiState.LoggedOut)?.guardType
             _uiState.value = if (repo.submitGuardCode(guardCode)) {
-                UiState.LoggedOut(loading = true, needsGuardCode = true, status = "Mengirim kode Steam Guard...")
+                guardState(loading = true, status = "Mengirim kode Steam Guard...", type = type)
             } else {
-                UiState.LoggedOut(needsGuardCode = true, error = "Masukkan kode Steam Guard dulu")
+                guardState(error = "Masukkan kode Steam Guard dulu", type = type)
             }
             return
         }
@@ -114,6 +152,40 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
+        startLogin(username, password, remember)
+    }
+
+    /**
+     * Tombol Kirim ulang di layar Steam Guard: sesi login yang lama dibuang, lalu Steam diminta mengirim
+     * persetujuan atau kode yang baru. Hanya dijalankan dari tombol itu, tidak pernah otomatis.
+     */
+    fun resendGuard() {
+        if (lastUser.isBlank() || lastPass.isEmpty()) {
+            _uiState.value = UiState.LoggedOut(error = "Masukkan nickname dan password lagi")
+            return
+        }
+        DebugLog.log("Tombol Kirim ulang ditekan")
+        loginJob?.cancel()
+        loginJob = null
+        startLogin(lastUser, lastPass, lastRemember)
+    }
+
+    /** Kembali dari layar Steam Guard ke layar login, dan menghentikan sesi login yang sedang menunggu. */
+    fun cancelLogin() {
+        DebugLog.log("Login dibatalkan dari layar Steam Guard")
+        loginJob?.cancel()
+        loginJob = null
+        repo.abortLogin()
+        guardSince = 0L
+        _uiState.value = UiState.LoggedOut()
+    }
+
+    private fun startLogin(username: String, password: String, remember: Boolean) {
+        lastUser = username.trim()
+        lastPass = password
+        lastRemember = remember
+        guardSince = 0L
+
         DebugLog.log("Tombol Login ditekan")
         _uiState.value = UiState.LoggedOut(loading = true, status = "Menghubungkan ke Steam...")
         loginJob = viewModelScope.launch {
@@ -121,43 +193,37 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 withTimeout(LOGIN_TIMEOUT_MS) {
                     repo.login(
-                        username = username.trim(),
+                        username = lastUser,
                         password = password,
                         onGuardCodeNeeded = { type, wrongCode ->
+                            if (guardSince == 0L) guardSince = System.currentTimeMillis()
                             _uiState.value = if (type == GuardType.APPROVAL) {
                                 // Belum ada yang salah: cukup setujui di Steam Mobile. Kode juga bisa diketik.
-                                UiState.LoggedOut(
-                                    loading = false,
-                                    needsGuardCode = true,
-                                    status = "Setujui login di aplikasi Steam Mobile, atau ketik kode Steam Guard lalu tekan Kirim kode."
-                                )
+                                guardState(type = type)
                             } else {
-                                val where = if (type == GuardType.EMAIL) "email" else "aplikasi Steam Mobile"
-                                UiState.LoggedOut(
-                                    loading = false,
-                                    needsGuardCode = true,
-                                    error = if (wrongCode) "Kode salah, coba lagi" else "Masukkan kode Steam Guard dari $where"
-                                )
+                                guardState(type = type, wrongCode = wrongCode)
                             }
                         },
                         onStatus = { message ->
-                            // Hanya di layar login. Kolom kode tetap tampil supaya kode bisa diketik lagi
+                            // Hanya di layar login. Layar Steam Guard tetap tampil supaya kode bisa diketik lagi
                             // setelah Steam meminta kode baru.
                             val current = _uiState.value
                             if (current is UiState.LoggedOut) {
-                                _uiState.value = UiState.LoggedOut(
-                                    loading = true,
-                                    needsGuardCode = current.needsGuardCode,
-                                    status = message
-                                )
+                                _uiState.value = current.copy(loading = true, error = null, status = message)
                             }
-                        }
+                        },
+                        remember = remember,
                     )
                 }
 
                 DebugLog.log("Login berhasil, lanjut mengambil daftar game")
                 step = "mengambil daftar game"
-                _uiState.value = UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
+                // Kalau login lewat layar Steam Guard, layarnya dipertahankan sampai daftar game siap
+                _uiState.value = if (guardSince != 0L) {
+                    guardState(loading = true, status = "Mengambil daftar game...")
+                } else {
+                    UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
+                }
                 val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGamesResilient() }
                 val games = owned.map { GameInfo(it.appId, it.name) }
                 ownedGames = games
@@ -166,6 +232,18 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 loadSizesInBackground(games)
                 loadPricesInBackground(games)
             } catch (e: Exception) {
+                // Dibatalkan pengguna (Kirim ulang atau kembali): bukan error, dan layarnya sudah diatur oleh yang membatalkan
+                if (e is CancellationException && e !is TimeoutCancellationException) throw e
+                val current = _uiState.value
+                if (e is TimeoutCancellationException && step == "login ke Steam" &&
+                    current is UiState.LoggedOut && current.needsGuardCode
+                ) {
+                    // Waktu menunggu persetujuan atau kode habis: tetap di layar Steam Guard dan buka tombol Kirim ulang
+                    DebugLog.log("Waktu menunggu Steam Guard habis")
+                    repo.abortLogin()
+                    _uiState.value = current.copy(loading = false, error = null, status = null, wrongCode = false, guardExpired = true)
+                    return@launch
+                }
                 DebugLog.log("ERROR saat $step: ${e.describe()}")
                 Log.e("SteamGrab", "Gagal saat $step", e)
                 _uiState.value = UiState.LoggedOut(error = "Gagal saat $step.\nDetail:\n${e.describe()}")

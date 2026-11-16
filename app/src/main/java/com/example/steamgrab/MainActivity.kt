@@ -83,6 +83,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DebugLog.init(applicationContext)
+        AppLanguage.init(applicationContext)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -102,22 +103,16 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     val storageAlert by vm.storageAlert.collectAsState()
     val platformChoice by vm.platformChoice.collectAsState()
 
-    // Notifikasi dibutuhkan agar progres download terlihat di Android 13 ke atas
-    val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
-
     val showDebug by DebugLog.visible.collectAsState()
     if (showDebug) DebugDialog(onClose = { DebugLog.setVisible(false) })
 
     // Izin akses semua file diminta di awal, sebelum login dan sebelum daftar game muncul.
     // Statusnya dicek ulang setiap aplikasi kembali ke layar (setelah pengguna dari pengaturan),
-    // jadi popup hilang sendiri begitu izin diberikan.
-    val context = LocalContext.current
+    // jadi saklar di layar izin menyala sendiri begitu izin diberikan.
     var hasAccess by remember { mutableStateOf(Storage.hasAllFilesAccess()) }
+    // Layar izin dilewati kalau izin sudah ada sejak awal. Kalau baru diberikan di layar itu, pengguna menekan Lanjutkan
+    // (supaya sempat memilih izin notifikasi yang opsional). Kalau izin dicabut kemudian, layarnya muncul lagi.
+    var setupDone by remember { mutableStateOf(hasAccess) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -126,47 +121,41 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    if (!hasAccess) {
-        AlertDialog(
-            onDismissRequest = {},
-            title = { Text("Izin penyimpanan dibutuhkan") },
-            text = {
-                Text(
-                    "SteamGrab menyimpan game ke folder Download/SteamGames di penyimpanan ponsel " +
-                        "supaya bisa dipindahkan ke PC lewat USB. Tanpa izin akses semua file, " +
-                        "aplikasi tidak bisa menulis ke folder itu dan tidak bisa menghitung ruang " +
-                        "yang dibutuhkan dengan benar.\n\n" +
-                        "Tekan tombol di bawah, lalu aktifkan \"Izinkan akses untuk mengelola semua file\"."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        try {
-                            context.startActivity(
-                                Intent(
-                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                    Uri.parse("package:${context.packageName}")
-                                )
-                            )
-                        } catch (e: Exception) {
-                            // Sebagian ponsel tidak punya halaman izin per aplikasi, buka daftar umumnya
-                            context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                        }
-                    }
-                }) { Text("Buka pengaturan izin") }
-            }
-        )
+    LaunchedEffect(hasAccess) { if (!hasAccess) setupDone = false }
+
+    // Isian login disimpan di sini, bukan di layar login, supaya tidak hilang saat layar berganti ke Steam Guard
+    // dan kembali (misalnya setelah login gagal).
+    var loginUser by remember { mutableStateOf(vm.savedAccount() ?: "") }
+    var loginPass by remember { mutableStateOf("") }
+    var loginRemember by remember { mutableStateOf(vm.rememberChoice()) }
+
+    if (!hasAccess || !setupDone) {
+        PermissionScreen(storageGranted = hasAccess, onContinue = { setupDone = true })
+        return
     }
 
     when (val s = state) {
-        is UiState.LoggedOut -> LoginScreen(
-            loading = s.loading,
-            error = s.error,
-            needsGuardCode = s.needsGuardCode,
-            status = s.status,
-            onLogin = { user, pass, guard -> vm.login(user, pass, guard) }
-        )
+        is UiState.LoggedOut -> if (s.needsGuardCode) {
+            GuardScreen(
+                state = s,
+                onSubmit = { code -> vm.login(loginUser, loginPass, code, loginRemember) },
+                onResend = { vm.resendGuard() },
+                onBack = { vm.cancelLogin() }
+            )
+        } else {
+            LoginScreen(
+                loading = s.loading,
+                error = s.error,
+                status = s.status,
+                username = loginUser,
+                onUsername = { loginUser = it },
+                password = loginPass,
+                onPassword = { loginPass = it },
+                remember = loginRemember,
+                onRemember = { loginRemember = it },
+                onLogin = { vm.login(loginUser, loginPass, null, loginRemember) }
+            )
+        }
         is UiState.GameList -> GameListScreen(
             games = s.games,
             sizes = sizes,
@@ -298,81 +287,6 @@ fun DebugDialog(onClose: () -> Unit) {
                     }
                 }
             }
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun LoginScreen(
-    loading: Boolean,
-    error: String?,
-    needsGuardCode: Boolean,
-    status: String?,
-    onLogin: (String, String, String?) -> Unit
-) {
-    var username by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var guardCode by remember { mutableStateOf("") }
-    var passwordVisible by remember { mutableStateOf(false) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text("Login Steam", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(16.dp))
-
-        OutlinedTextField(
-            value = username, onValueChange = { username = it },
-            label = { Text("Username") }, modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = password, onValueChange = { password = it },
-            label = { Text("Password") },
-            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-            trailingIcon = {
-                IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                    EyeIcon(visible = passwordVisible)
-                }
-            },
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        if (needsGuardCode) {
-            Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = guardCode, onValueChange = { guardCode = it },
-                label = { Text("Kode Steam Guard") },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-
-        error?.let {
-            Spacer(Modifier.height(8.dp))
-            // SelectionContainer supaya teks error bisa disalin dan dikirim ke pengembang
-            SelectionContainer {
-                Text(it, color = MaterialTheme.colorScheme.error)
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-        status?.let {
-            Text(it, style = MaterialTheme.typography.bodyMedium)
-            Spacer(Modifier.height(8.dp))
-        }
-        Button(
-            onClick = { onLogin(username, password, guardCode.ifBlank { null }) },
-            // Saat menunggu kode, tombol baru aktif setelah kode diisi. Saat menunggu persetujuan di Steam Mobile, tidak wajib.
-            enabled = !loading && username.isNotBlank() && password.isNotBlank() &&
-                (!needsGuardCode || guardCode.isNotBlank()),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            if (loading) CircularProgressIndicator(modifier = Modifier.size(20.dp))
-            else Text(if (needsGuardCode) "Kirim kode" else "Login")
         }
     }
 }
