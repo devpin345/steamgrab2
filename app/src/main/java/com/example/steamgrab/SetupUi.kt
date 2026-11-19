@@ -193,6 +193,7 @@ private fun GlassField(
     onDone: () -> Unit = {},
     visualTransformation: VisualTransformation = VisualTransformation.None,
     enabled: Boolean = true,
+    supporting: String? = null,
     trailing: (@Composable () -> Unit)? = null,
 ) {
     Column(modifier) {
@@ -225,6 +226,14 @@ private fun GlassField(
                 )
             }
             trailing?.invoke()
+        }
+        supporting?.let {
+            Text(
+                it,
+                color = Color.White.copy(alpha = 0.65f),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(start = 4.dp, top = 5.dp)
+            )
         }
     }
 }
@@ -413,7 +422,11 @@ fun LoginScreen(
                         label = "Nickname",
                         value = username,
                         onValueChange = onUsername,
-                        enabled = !loading
+                        enabled = !loading,
+                        supporting = tr(
+                            "Nama akun untuk login Steam, bukan nama profil.",
+                            "The account name you log in to Steam with, not your profile name."
+                        )
                     )
                     Spacer(Modifier.height(14.dp))
                     GlassField(

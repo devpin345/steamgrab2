@@ -67,6 +67,16 @@ object Libraries {
     private fun defaultPrimaryLibrary(): File =
         File(Environment.getExternalStoragePublicDirectory("Download"), "SteamGames")
 
+    /** Semua volume yang dilaporkan sistem beserta keadaannya, untuk log kalau penyimpanan tidak terdeteksi. */
+    fun rawReport(): String {
+        val ctx = appContext ?: return "belum siap"
+        val manager = ctx.getSystemService(StorageManager::class.java) ?: return "StorageManager tidak ada"
+        return manager.storageVolumes.joinToString("; ") { v ->
+            "${v.uuid ?: "primary"} state=${v.state} dir=${directoryOf(v)?.path} " +
+                "primary=${v.isPrimary} lepasan=${v.isRemovable}"
+        }.ifEmpty { "sistem tidak melaporkan volume" }
+    }
+
     /** Penyimpanan yang tersambung dan bisa dibaca, memori internal paling atas. */
     fun volumes(): List<StorageVolumeInfo> {
         val ctx = appContext

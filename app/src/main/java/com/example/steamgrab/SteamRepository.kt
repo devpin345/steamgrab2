@@ -95,6 +95,10 @@ class SteamRepository private constructor(context: Context) {
     private var pendingPass: String? = null
     // "Remember me": kalau true, token login disimpan dan dipakai lagi (tanpa Steam Guard) untuk akun yang sama
     @Volatile private var pendingRemember = true
+    // Steam menolak kredensial (password atau nama akun salah, terlalu banyak percobaan, dst.). Selama true, sambungan yang
+    // diputus Steam setelah penolakan tidak disambung ulang otomatis, karena sambung ulang akan mengirim kredensial
+    // yang sama lagi dan menambah percobaan gagal di akun.
+    @Volatile private var loginRejected = false
 
     /** Nama akun yang diingat dari login sebelumnya, untuk mengisi kolom Nickname. Null kalau tidak diingat. */
     fun savedAccount(): String? = prefs.getString(KEY_ACCOUNT, null)
@@ -142,7 +146,10 @@ class SteamRepository private constructor(context: Context) {
             connected = false
             sessionActive = false
             DebugLog.log("Koneksi ke Steam terputus (dibatalkan pengguna: ${cb.isUserInitiated})")
-            if (!cb.isUserInitiated) {
+            if (!cb.isUserInitiated && loginRejected) {
+                connecting = false
+                DebugLog.log("Login ditolak Steam, tidak menyambung ulang otomatis")
+            } else if (!cb.isUserInitiated) {
                 connecting = false
                 // Kode yang sedang ditunggu ikut batal. Setelah tersambung, kode diminta lagi dari sesi yang sama.
                 // activeSession dan awaitingApproval sengaja dipertahankan: loop tunggu melanjutkan sesi itu,
@@ -195,6 +202,7 @@ class SteamRepository private constructor(context: Context) {
         // yang melanjutkan sesi lama.
         authGeneration.incrementAndGet()
         pendingRemember = remember
+        loginRejected = false
         prefs.edit().putBoolean(KEY_REMEMBER, remember).apply()
         if (!remember) prefs.edit().remove(KEY_TOKEN).remove(KEY_ACCOUNT).apply()
         activeSession = null
@@ -975,13 +983,24 @@ class SteamRepository private constructor(context: Context) {
                 // Gagal sungguhan (bukan koneksi): sesi ini tidak bisa dilanjutkan lagi
                 activeSession = null
                 awaitingApproval = false
-                val shown: Throwable = if (e.authRejection()?.result == EResult.Expired) {
-                    IllegalStateException(
+                // Kredensial yang ditolak tidak dikirim lagi sampai pengguna menekan tombol login
+                loginRejected = true
+                pendingPass = null
+                val shown: Throwable = when (e.authRejection()?.result) {
+                    EResult.Expired -> IllegalStateException(
                         "Permintaan persetujuan di Steam Mobile sudah kedaluwarsa. Tekan Login untuk meminta yang baru.",
                         e
                     )
-                } else {
-                    e
+                    EResult.InvalidPassword -> IllegalStateException(
+                        "Nama akun atau password salah. Isi dengan nama akun yang dipakai untuk login Steam " +
+                            "(bukan nama profil), lalu periksa passwordnya.",
+                        e
+                    )
+                    EResult.RateLimitExceeded, EResult.AccountLoginDeniedThrottle -> IllegalStateException(
+                        "Steam membatasi percobaan login untuk sementara. Tunggu beberapa menit, lalu coba lagi.",
+                        e
+                    )
+                    else -> e
                 }
                 loggedOn.completeExceptionally(shown)
             }

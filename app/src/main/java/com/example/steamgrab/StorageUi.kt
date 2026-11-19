@@ -92,6 +92,7 @@ fun StorageScreen(setup: Boolean, onDone: () -> Unit) {
     val volumes = remember(version) {
         Libraries.volumes().also { list ->
             // Dicatat supaya kalau flashdisk tidak muncul, penyebabnya terlihat di log Debug
+            DebugLog.log("Volume dari sistem: " + Libraries.rawReport())
             DebugLog.log(
                 "Penyimpanan terdeteksi: " + list.joinToString("; ") {
                     "${it.id} ${it.root.path}${if (it.removable) " (lepasan)" else ""}"
