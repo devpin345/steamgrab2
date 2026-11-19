@@ -98,6 +98,10 @@ class DownloadService : Service() {
         val appId = intent?.getIntExtra(EXTRA_APP_ID, -1) ?: -1
         val name = intent?.getStringExtra(EXTRA_NAME) ?: "App $appId"
         val platform = Platform.fromSteamName(intent?.getStringExtra(EXTRA_OS))
+        Libraries.init(applicationContext)
+        // Library tujuan dipilih di aplikasi. Kalau tidak ada, dicari dari tempat game sudah berada atau pilihan terakhir.
+        val library = intent?.getStringExtra(EXTRA_LIBRARY)?.let { Library(java.io.File(it)) }
+            ?: Libraries.resolveFor(appId).library
         startForegroundCompat(buildNotification(name, DownloadProgress(), 0L))
 
         if (appId <= 0) {
@@ -135,7 +139,7 @@ class DownloadService : Service() {
                 // Logo notifikasi dimuat sambil jalan, supaya jaringan yang lambat tidak menunda mulainya download.
                 // Dijalankan di scope service, bukan anak job ini, supaya job download tidak ikut menunggunya.
                 scope.launch { largeIcon = GameImages.load(appId) }
-                val dir = SteamRepository.get(applicationContext).downloadGame(appId, platform) { p -> latest = p }
+                val dir = SteamRepository.get(applicationContext).downloadGame(appId, platform, library) { p -> latest = p }
                 finished = true
                 _status.value = DownloadStatus.Finished(appId, dir.absolutePath)
                 postResult("Selesai: $name")
@@ -280,6 +284,7 @@ class DownloadService : Service() {
         const val EXTRA_APP_ID = "app_id"
         const val EXTRA_NAME = "name"
         const val EXTRA_OS = "os"
+        const val EXTRA_LIBRARY = "library"
 
         private const val CHANNEL_ID = "download"
         private const val NOTIF_ID = 1

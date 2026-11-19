@@ -381,14 +381,19 @@ class SteamRepository private constructor(context: Context) {
     }
 
     /**
-     * Mengunduh satu game ke Download/SteamGames/steamapps/common/<installdir>,
+     * Mengunduh satu game ke <library>/steamapps/common/<installdir>,
      * lalu menulis appmanifest_<appid>.acf. Melempar exception jika gagal atau dibatalkan.
      * Pembatalan dilakukan dengan membatalkan coroutine pemanggilnya.
      * [onProgress] dipanggil setiap ada chunk yang selesai, dengan progres semua depot digabung.
      */
-    suspend fun downloadGame(appId: Int, platform: Platform, onProgress: (DownloadProgress) -> Unit): File =
+    suspend fun downloadGame(
+        appId: Int,
+        platform: Platform,
+        library: Library,
+        onProgress: (DownloadProgress) -> Unit,
+    ): File =
         withContext(Dispatchers.IO) {
-            DebugLog.log("Download game $appId dimulai (versi ${platform.label})")
+            DebugLog.log("Download game $appId dimulai (versi ${platform.label}, library ${library.root.path})")
             val depots = ConcurrentHashMap<Int, DepotProgress>()
             // Byte yang sudah masuk per depot pada sesi ini, dalam bentuk yang dipakai appmanifest
             val snapshot = { depots.mapValues { it.value.compressed to it.value.uncompressed } }
@@ -399,10 +404,10 @@ class SteamRepository private constructor(context: Context) {
             // Ukuran untuk versi yang dipilih. Ukuran tiap versi berbeda, jadi bukan selalu yang ada di daftar game.
             val size = knownSize(appId, platform)
             val knownTotal = size?.download ?: 0L
-            val previous = Storage.downloadedBefore(appId, knownTotal)
+            val previous = library.downloadedBefore(appId, knownTotal)
             // Game yang sudah tercatat selesai lalu diperiksa ulang tidak boleh langsung tampil 100%: yang terjadi
             // adalah pemeriksaan file, dan angka sebenarnya baru datang dari library sesudah itu.
-            val installedBefore = Storage.appStates()[appId]?.let { Storage.isComplete(it) } == true
+            val installedBefore = library.appStates()[appId]?.let { Storage.isComplete(it) } == true
             val prior = if (installedBefore) 0L else previous
             // Selama pemeriksaan ulang, catatan di appmanifest tidak boleh menyusut kalau pemeriksaan dihentikan
             val persistFloor = if (installedBefore) previous else 0L
@@ -430,10 +435,10 @@ class SteamRepository private constructor(context: Context) {
             // "belum selesai", jadi Steam di PC tahu game ini belum lengkap dan tidak menganggapnya terinstal.
             DownloadActivity.step("Membuat folder library dan catatan awal (appmanifest)")
             runCatching {
-                Storage.ensureLibrary()
-                writeAppManifest(appId, emptyMap(), complete = false, downloaded = maxOf(prior, persistFloor), total = size)
+                library.ensureLibrary()
+                writeAppManifest(appId, library, emptyMap(), complete = false, downloaded = maxOf(prior, persistFloor), total = size)
             }.onSuccess {
-                DownloadActivity.step("Folder siap: Download/SteamGames/steamapps (common, libraryfolder.vdf, appmanifest_$appId.acf)")
+                DownloadActivity.step("Folder siap: ${library.root.path}/steamapps (common, libraryfolder.vdf, appmanifest_$appId.acf)")
             }.onFailure {
                 DebugLog.log("Gagal menulis appmanifest awal: ${it.describe()}")
                 DownloadActivity.step("Gagal membuat folder atau appmanifest awal: ${it.describe().lineSequence().first()}")
@@ -578,7 +583,7 @@ class SteamRepository private constructor(context: Context) {
                     AppItem(
                         appId = appId,
                         installToGameNameDirectory = true,
-                        installDirectory = Storage.commonDir().absolutePath,
+                        installDirectory = library.commonDir().absolutePath,
                         branch = "public",
                         os = platform.steamName,
                         osArch = "64",
@@ -602,17 +607,17 @@ class SteamRepository private constructor(context: Context) {
                     ?: error("Nama folder install untuk app $appId kosong")
 
                 DownloadActivity.step("Menulis appmanifest_$appId.acf sebagai game terinstal (StateFlags 4)")
-                writeAppManifest(appId, snapshot(), complete = true, kv = app.keyValues, total = size)
+                writeAppManifest(appId, library, snapshot(), complete = true, kv = app.keyValues, total = size)
                 completed.set(true)
                 reportProgress()
                 DownloadActivity.step("Selesai")
-                Storage.gameDir(installDir)
+                library.gameDir(installDir)
             } catch (e: Throwable) {
                 // Dijeda, dibatalkan, atau gagal: manifest tetap bertanda belum selesai, dengan jumlah byte yang sudah masuk
                 val stopped = if (e is java.util.concurrent.CancellationException) "Dihentikan (jeda atau batal)" else "Gagal"
                 DownloadActivity.step("$stopped. Menyimpan catatan progres ke appmanifest")
                 runCatching {
-                    writeAppManifest(appId, snapshot(), complete = false, downloaded = maxOf(lastDone.get(), persistFloor), total = size)
+                    writeAppManifest(appId, library, snapshot(), complete = false, downloaded = maxOf(lastDone.get(), persistFloor), total = size)
                 }
                 throw e
             } finally {
@@ -1108,6 +1113,7 @@ class SteamRepository private constructor(context: Context) {
      */
     private fun writeAppManifest(
         appId: Int,
+        library: Library,
         depots: Map<Int, Pair<Long, Long>>,
         complete: Boolean,
         kv: KeyValue? = appInfos[appId],
@@ -1183,7 +1189,7 @@ class SteamRepository private constructor(context: Context) {
             append("}\n")
         }
 
-        val file = Storage.manifestFile(appId)
+        val file = library.manifestFile(appId)
         file.parentFile?.mkdirs()
         file.writeText(text)
     }

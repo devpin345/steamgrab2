@@ -84,6 +84,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         DebugLog.init(applicationContext)
         AppLanguage.init(applicationContext)
+        Libraries.init(applicationContext)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -102,6 +103,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     val prices by vm.prices.collectAsState()
     val storageAlert by vm.storageAlert.collectAsState()
     val platformChoice by vm.platformChoice.collectAsState()
+    val locationChoice by vm.locationChoice.collectAsState()
 
     val showDebug by DebugLog.visible.collectAsState()
     if (showDebug) DebugDialog(onClose = { DebugLog.setVisible(false) })
@@ -129,8 +131,23 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     var loginPass by remember { mutableStateOf("") }
     var loginRemember by remember { mutableStateOf(vm.rememberChoice()) }
 
+    // Pilihan penyimpanan ditampilkan sekali setelah izin. Layar yang sama bisa dibuka lagi dari daftar game.
+    var storageSetupDone by remember { mutableStateOf(Libraries.setupDone) }
+    var showStorage by remember { mutableStateOf(false) }
+
     if (!hasAccess || !setupDone) {
         PermissionScreen(storageGranted = hasAccess, onContinue = { setupDone = true })
+        return
+    }
+    if (!storageSetupDone) {
+        StorageScreen(setup = true, onDone = {
+            Libraries.setupDone = true
+            storageSetupDone = true
+        })
+        return
+    }
+    if (showStorage) {
+        StorageScreen(setup = false, onDone = { showStorage = false })
         return
     }
 
@@ -162,7 +179,8 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             sizesLoading = sizesLoading,
             free = prices,
             onSelect = { appId -> vm.requestDownload(appId) },
-            onOpenDownload = { vm.openRunningDownload() }
+            onOpenDownload = { vm.openRunningDownload() },
+            onOpenStorage = { showStorage = true }
         )
         is UiState.Downloading -> DownloadScreen(
             state = s,
@@ -219,6 +237,37 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             },
             confirmButton = {},
             dismissButton = { TextButton(onClick = { vm.dismissPlatformChoice() }) { Text("Batal") } }
+        )
+    }
+
+    // Popup pilih lokasi simpan. Hanya muncul kalau lebih dari satu penyimpanan punya library.
+    locationChoice?.let { choice ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissLocationChoice() },
+            title = { Text("Simpan ke mana?") },
+            text = {
+                Column {
+                    Text(choice.gameName, style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(12.dp))
+                    choice.options.forEach { option ->
+                        OutlinedButton(
+                            onClick = { vm.chooseLocation(choice, option) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
+                                Text(option.label, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "${option.path} · kosong ${formatBytes(option.freeBytes)}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { vm.dismissLocationChoice() }) { Text("Batal") } }
         )
     }
 
@@ -328,7 +377,8 @@ fun GameListScreen(
     sizesLoading: Boolean,
     free: Map<Int, Boolean>,
     onSelect: (Int) -> Unit,
-    onOpenDownload: () -> Unit
+    onOpenDownload: () -> Unit,
+    onOpenStorage: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(LibraryFilter.ALL) }
@@ -353,7 +403,7 @@ fun GameListScreen(
             title = { Text(game.name) },
             text = {
                 Text(
-                    "Game ini sudah selesai diunduh dan tersimpan di Download/SteamGames/steamapps/common. " +
+                    "Game ini sudah selesai diunduh dan tersimpan di folder library (steamapps/common). " +
                         "Tidak perlu diunduh lagi. Pilih Periksa ulang kalau ingin memastikan semua filenya lengkap."
                 )
             },
@@ -368,7 +418,10 @@ fun GameListScreen(
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Pilih Game", style = MaterialTheme.typography.headlineSmall)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Pilih Game", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            TextButton(onClick = onOpenStorage) { Text("Penyimpanan") }
+        }
 
         // Download yang sedang berjalan atau dijeda. Ketuk untuk membuka halaman progresnya.
         val banner: Triple<String, DownloadProgress, String>? = when (val st = running) {

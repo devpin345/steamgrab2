@@ -230,7 +230,7 @@ private fun GlassField(
 }
 
 @Composable
-private fun GlassButton(
+internal fun GlassButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,

@@ -28,6 +28,12 @@ data class GameInfo(val appId: Int, val name: String)
 /** Pesan untuk popup memori penuh. Ukuran dalam byte. */
 data class StorageAlert(val gameName: String, val neededBytes: Long, val freeBytes: Long)
 
+/** Satu tujuan di popup pilih lokasi simpan. [path] adalah folder library-nya. */
+data class LocationOption(val path: String, val label: String, val freeBytes: Long)
+
+/** Permintaan memilih lokasi simpan, hanya muncul kalau lebih dari satu penyimpanan punya library. */
+data class LocationChoice(val appId: Int, val gameName: String, val platform: Platform, val options: List<LocationOption>)
+
 sealed class UiState {
     data class LoggedOut(
         val loading: Boolean = false,
@@ -85,6 +91,9 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     private val _platformChoice = MutableStateFlow<PlatformChoice?>(null)
     val platformChoice: StateFlow<PlatformChoice?> = _platformChoice.asStateFlow()
 
+    private val _locationChoice = MutableStateFlow<LocationChoice?>(null)
+    val locationChoice: StateFlow<LocationChoice?> = _locationChoice.asStateFlow()
+
     private var ownedGames: List<GameInfo> = emptyList()
     private var watchingAppId: Int? = null
     private var sizeJob: Job? = null
@@ -100,6 +109,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     init {
         GamePriceStore.init(app)
         PlatformStore.init(app)
+        Libraries.init(app)
         // Status download datang dari DownloadService, UI hanya menampilkannya
         viewModelScope.launch {
             DownloadService.status.collect { onDownloadStatus(it) }
@@ -284,11 +294,54 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun requestDownload(appId: Int, platform: Platform) {
         val game = ownedGames.find { it.appId == appId } ?: return
+        // Game yang sudah ada (selesai atau dijeda) tetap di library tempatnya berada. Untuk game baru, pilihan
+        // lokasi hanya ditanyakan kalau ada lebih dari satu penyimpanan dengan library. Kalau cuma satu, langsung dipakai.
+        val existing = Libraries.locate(appId)
+        if (existing != null) {
+            beginDownload(appId, platform, existing.library)
+            return
+        }
+        val targets = Libraries.available()
+        if (targets.size > 1) {
+            _locationChoice.value = LocationChoice(
+                appId, game.name, platform,
+                targets.map { ref ->
+                    LocationOption(
+                        path = ref.library.root.path,
+                        label = if (ref.volume.primary) "Memori internal" else ref.volume.label,
+                        freeBytes = ref.volume.freeBytes,
+                    )
+                }
+            )
+            return
+        }
+        beginDownload(appId, platform, (targets.firstOrNull() ?: Libraries.defaultRef()).library)
+    }
+
+    /** Pengguna memilih lokasi simpan di popup. Lanjut ke pengecekan ruang dan download. */
+    fun chooseLocation(choice: LocationChoice, option: LocationOption) {
+        _locationChoice.value = null
+        val ref = Libraries.refFor(option.path)
+        if (ref == null) {
+            DebugLog.log("Lokasi ${option.path} tidak lagi tersambung")
+            return
+        }
+        beginDownload(choice.appId, choice.platform, ref.library)
+    }
+
+    fun dismissLocationChoice() {
+        _locationChoice.value = null
+    }
+
+    private fun beginDownload(appId: Int, platform: Platform, library: Library) {
+        val game = ownedGames.find { it.appId == appId } ?: return
+        // Dicatat supaya Lanjutkan setelah jeda memakai library yang sama
+        Libraries.rememberTarget(appId, library)
         viewModelScope.launch {
             // Catatan kegiatan untuk panel detail di layar download dimulai dari pengecekan ruang
             DownloadActivity.reset()
             DownloadActivity.step("Mengecek ruang penyimpanan untuk versi ${platform.label}")
-            val check = withContext(Dispatchers.IO) { checkStorage(appId, platform) }
+            val check = withContext(Dispatchers.IO) { checkStorage(appId, platform, library) }
             if (check != null && check.first > check.second) {
                 DebugLog.log("Memori tidak cukup untuk ${game.name}")
                 _storageAlert.value = StorageAlert(game.name, check.first, check.second)
@@ -313,7 +366,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
      * Mengembalikan (butuh, tersedia) dalam byte. Null kalau ukuran game belum bisa dihitung,
      * dan download tetap dicoba.
      */
-    private suspend fun checkStorage(appId: Int, platform: Platform): Pair<Long, Long>? {
+    private suspend fun checkStorage(appId: Int, platform: Platform, library: Library): Pair<Long, Long>? {
         val size = repo.knownSize(appId, platform) ?: try {
             DownloadActivity.step("Menghitung ukuran game dari info Steam")
             repo.computeDownloadSize(appId, platform).also {
@@ -328,10 +381,10 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         // menunjukkan berapa yang sudah benar-benar terunduh (itu yang dulu membuat kebutuhan terhitung 0 B).
         // Yang dipakai adalah catatan byte terunduh di appmanifest. Game yang sudah selesai butuh 0 B tambahan,
         // game yang dijeda di 70% hanya butuh sisanya, bukan ukuran penuh lagi.
-        val before = Storage.downloadedBefore(appId, size.download)
+        val before = library.downloadedBefore(appId, size.download)
         val fraction = if (size.download > 0L) (before.toDouble() / size.download).coerceIn(0.0, 1.0) else 0.0
         val needed = (size.disk * (1.0 - fraction)).toLong()
-        val free = Storage.freeBytes()
+        val free = library.freeBytes()
         DebugLog.log("Cek ruang: butuh ${formatBytes(needed)}, tersedia ${formatBytes(free)}")
         return needed to free
     }
@@ -400,6 +453,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 .putExtra(DownloadService.EXTRA_APP_ID, appId)
                 .putExtra(DownloadService.EXTRA_NAME, game.name)
                 .putExtra(DownloadService.EXTRA_OS, platform.steamName)
+                .putExtra(DownloadService.EXTRA_LIBRARY, Libraries.resolveFor(appId).library.root.path)
         )
     }
 
