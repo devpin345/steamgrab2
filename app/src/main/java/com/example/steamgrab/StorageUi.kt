@@ -89,7 +89,16 @@ fun StorageScreen(setup: Boolean, onDone: () -> Unit) {
         }
     }
 
-    val volumes = remember(version) { Libraries.volumes() }
+    val volumes = remember(version) {
+        Libraries.volumes().also { list ->
+            // Dicatat supaya kalau flashdisk tidak muncul, penyebabnya terlihat di log Debug
+            DebugLog.log(
+                "Penyimpanan terdeteksi: " + list.joinToString("; ") {
+                    "${it.id} ${it.root.path}${if (it.removable) " (lepasan)" else ""}"
+                }
+            )
+        }
+    }
     var browsing by remember { mutableStateOf<StorageVolumeInfo?>(null) }
     var blocked by remember { mutableStateOf(false) }
     var expandedId by remember { mutableStateOf<String?>(null) }
