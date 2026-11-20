@@ -121,6 +121,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
     init {
         GamePriceStore.init(app)
         PlatformStore.init(app)
+        GameImages.init(app)
         Libraries.init(app)
         // Status download datang dari DownloadService, UI hanya menampilkannya
         viewModelScope.launch {

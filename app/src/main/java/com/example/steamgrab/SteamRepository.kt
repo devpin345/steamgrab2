@@ -426,6 +426,12 @@ class SteamRepository private constructor(context: Context) {
                     ?.takeIf { it.isNotBlank() }
                     ?.let { names[app.id] = it }
                 app.keyValues["common"]["type"].asString()?.let { types[app.id] = it.lowercase() }
+                // Nama file ikon asli game, dipakai layar penyimpanan
+                GameImages.recordIcons(
+                    app.id,
+                    app.keyValues["common"]["clienticon"].asString(),
+                    app.keyValues["common"]["icon"].asString()
+                )
                 appInfos[app.id] = app.keyValues
             }
         }

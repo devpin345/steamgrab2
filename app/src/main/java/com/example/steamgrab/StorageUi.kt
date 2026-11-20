@@ -421,12 +421,12 @@ private fun GameRow(game: LibraryGame) {
     }
 }
 
-/** Ikon game: bagian tengah gambar header Steam dipotong jadi persegi. */
+/** Ikon asli game dari Steam (Client Icon). Kotak polos selama belum ada atau kalau game tidak punya ikon. */
 @Composable
 private fun GameIcon(appId: Int, modifier: Modifier) {
     val du = LocalDu.current
-    val bitmap by produceState<Bitmap?>(initialValue = GameImages.cached(appId), key1 = appId) {
-        value = GameImages.load(appId)
+    val bitmap by produceState<Bitmap?>(initialValue = GameImages.cachedIcon(appId), key1 = appId) {
+        value = GameImages.loadIcon(appId)
     }
     val shape = RoundedCornerShape(du.dp(7f))
     val b = bitmap
@@ -434,7 +434,7 @@ private fun GameIcon(appId: Int, modifier: Modifier) {
         Image(
             bitmap = b.asImageBitmap(),
             contentDescription = null,
-            contentScale = ContentScale.Crop,
+            contentScale = ContentScale.Fit,
             modifier = modifier.clip(shape)
         )
     } else {
