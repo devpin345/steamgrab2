@@ -22,12 +22,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
@@ -40,13 +44,16 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -56,7 +63,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
@@ -68,7 +74,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.Locale
 
-// Layar login, Steam Guard, dan izin. Gaya mengikuti desain: latar gradasi, kartu kaca ungu-biru, tombol biru.
+// Layar login, Steam Guard, dan izin. Semua ukuran mengikuti file desain (lihat DesignScale.kt): posisi dan ukuran
+// tiap elemen diukur dari file desain, dalam satuan desain.
 
 /** Bahasa teks di layar setup dan login. Layar lain masih berbahasa Indonesia. */
 object AppLanguage {
@@ -106,59 +113,66 @@ fun tr(id: String, en: String): String {
     return if (code == "id") id else en
 }
 
-private object GlassColors {
+internal object GlassColors {
     val BgTop = Color(0xFF203858)
     val BgBottom = Color(0xFF1B2838)
     val Olive = Color(0xCC8E8E4F)
-    val CardStart = Color(0xFF3C297A)
-    val CardMid = Color(0xFF1B283B)
-    val CardEnd = Color(0xFF152433)
-    val BorderStart = Color(0xFF5B45D6)
-    val BorderEnd = Color(0xFF2F4F93)
+    val CardStart = Color(0xFF3D2B76)
+    val CardMid = Color(0xFF162331)
+    val CardEnd = Color(0xFF192837)
+    val BorderStart = Color(0xFF6341FF)
+    val BorderEnd = Color(0xFF2D4A7A)
     val Blue = Color(0xFF1F63FF)
-    val BlueIdle = Color(0xFF2B4254)
-    val BlueIdleText = Color(0xFF8DA0AD)
+    val BlueIdle = Color(0xFF28414F)
+    val BlueIdleText = Color(0xFF808080)
     val Purple = Color(0xFF6435FD)
+    val PurpleIdle = Color(0xFF182034)
+    val ToggleOn = Color(0xFF614AE3)
     val Error = Color(0xFFFF8A8A)
-    val Red = Color(0xFFE62E3E)
+    val Red = Color(0xFFE62D3B)
 }
 
 /** Latar halaman: gradasi biru tua dengan cahaya zaitun di pojok kiri atas dan logo Steam kabur di kanan bawah. */
 @Composable
 fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(GlassColors.BgTop, GlassColors.BgBottom)))
-            .drawBehind {
-                drawRect(
-                    Brush.radialGradient(
-                        colors = listOf(GlassColors.Olive, Color.Transparent),
-                        center = Offset.Zero,
-                        radius = size.width * 1.1f
+    ProvideDu { du ->
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Brush.verticalGradient(listOf(GlassColors.BgTop, GlassColors.BgBottom)))
+                .drawBehind {
+                    drawRect(
+                        Brush.radialGradient(
+                            colors = listOf(GlassColors.Olive, Color.Transparent),
+                            center = Offset.Zero,
+                            radius = size.width * 1.1f
+                        )
                     )
-                )
-            }
-    ) {
-        Image(
-            painter = painterResource(R.drawable.steam_logo_blur),
-            contentDescription = null,
-            alpha = 0.5f,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .offset(x = 110.dp, y = 90.dp)
-                .size(380.dp)
-        )
-        content()
+                }
+        ) {
+            // Logo di desain: 940 satuan, mulai dari x=210.6, tepi atasnya di y=631.3 pada halaman setinggi 1440
+            Image(
+                painter = painterResource(R.drawable.steam_logo_blur),
+                contentDescription = null,
+                alpha = 0.5f,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .offset(x = du.dp(341f), y = du.dp(131.8f))
+                    .size(du.dp(940f))
+            )
+            content()
+        }
     }
 }
 
+/** Kartu kaca: gradasi ungu ke biru tua dengan garis tepi ungu ke biru. */
 @Composable
-fun GlassCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    val shape = RoundedCornerShape(18.dp)
-    Column(
+fun GlassPanel(modifier: Modifier = Modifier, content: @Composable BoxScope.() -> Unit) {
+    val du = LocalDu.current
+    val shape = RoundedCornerShape(du.dp(16f))
+    Box(
         modifier = modifier
-            .shadow(18.dp, shape, ambientColor = Color.Black, spotColor = Color.Black)
+            .shadow(du.dp(30f), shape, ambientColor = Color.Black, spotColor = Color.Black)
             .clip(shape)
             .background(
                 Brush.linearGradient(
@@ -167,77 +181,63 @@ fun GlassCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.()
                     1f to GlassColors.CardEnd
                 )
             )
-            .border(1.dp, Brush.linearGradient(listOf(GlassColors.BorderStart, GlassColors.BorderEnd)), shape)
-            .padding(22.dp),
+            .border(
+                du.dp(2.5f),
+                Brush.linearGradient(listOf(GlassColors.BorderStart, GlassColors.BorderEnd)),
+                shape
+            ),
         content = content
     )
 }
 
-/** Kotak berisi gradasi ungu ke biru tua, dipakai untuk kolom isian dan kotak logo. */
-private fun fieldSurface(modifier: Modifier): Modifier {
-    val shape = RoundedCornerShape(14.dp)
+/** Kotak berisi gradasi ungu ke biru tua, dipakai untuk kolom isian dan kotak kode QR. */
+private fun fieldSurface(du: Du, modifier: Modifier): Modifier {
+    val shape = RoundedCornerShape(du.dp(20f))
     return modifier
         .clip(shape)
-        .background(Brush.horizontalGradient(listOf(Color(0xFF372869), Color(0xFF1A2A3E), Color(0xFF162636))))
-        .border(1.5.dp, Brush.horizontalGradient(listOf(Color(0xFF6B4DEB), Color(0xFF34508F))), shape)
+        .background(Brush.horizontalGradient(listOf(Color(0xFF38296E), Color(0xFF1A2A3E), Color(0xFF182737))))
+        .border(du.dp(2f), Brush.horizontalGradient(listOf(Color(0xFF633CF6), Color(0xFF2D496C))), shape)
 }
 
+/** Tombol sesuai desain. Ukurannya diatur pemanggil lewat [modifier]. */
 @Composable
-private fun GlassField(
-    label: String,
-    value: String,
-    onValueChange: (String) -> Unit,
-    modifier: Modifier = Modifier,
-    keyboardType: KeyboardType = KeyboardType.Text,
-    imeAction: ImeAction = ImeAction.Next,
-    onDone: () -> Unit = {},
-    visualTransformation: VisualTransformation = VisualTransformation.None,
-    enabled: Boolean = true,
-    supporting: String? = null,
-    trailing: (@Composable () -> Unit)? = null,
+private fun DesignButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier,
+    textSize: Float,
+    radius: Float,
+    bold: Boolean,
+    enabled: Boolean,
+    loading: Boolean,
+    activeColor: Color,
+    idleColor: Color,
+    idleTextColor: Color,
 ) {
-    Column(modifier) {
-        Text(
-            label,
-            color = Color.White,
-            fontSize = 16.sp,
-            modifier = Modifier.padding(start = 4.dp, bottom = 6.dp)
-        )
-        Row(
-            fieldSurface(Modifier.fillMaxWidth().height(54.dp)).padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(Modifier.weight(1f)) {
-                BasicTextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    enabled = enabled,
-                    singleLine = true,
-                    textStyle = TextStyle(color = Color.White, fontSize = 16.sp),
-                    cursorBrush = SolidColor(Color.White),
-                    visualTransformation = visualTransformation,
-                    keyboardOptions = KeyboardOptions(
-                        capitalization = KeyboardCapitalization.None,
-                        keyboardType = keyboardType,
-                        imeAction = imeAction
-                    ),
-                    keyboardActions = KeyboardActions(onDone = { onDone() }),
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-            trailing?.invoke()
-        }
-        supporting?.let {
-            Text(
-                it,
-                color = Color.White.copy(alpha = 0.65f),
-                fontSize = 12.sp,
-                modifier = Modifier.padding(start = 4.dp, top = 5.dp)
+    val du = LocalDu.current
+    val active = enabled && !loading
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(du.dp(radius)))
+            .background(if (enabled || loading) activeColor else idleColor)
+            .clickable(enabled = active, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        if (loading) {
+            CircularProgressIndicator(Modifier.size(du.dp(40f)), color = Color.White, strokeWidth = du.dp(4f))
+        } else {
+            DText(
+                text,
+                textSize,
+                color = if (enabled) Color.White else idleTextColor,
+                bold = bold,
+                lineHeight = textSize * 1.3f
             )
         }
     }
 }
 
+/** Tombol biasa untuk layar lain yang memakai gaya kaca (pemilih folder). */
 @Composable
 internal fun GlassButton(
     text: String,
@@ -266,6 +266,7 @@ internal fun GlassButton(
                 text,
                 color = if (enabled) Color.White else idleTextColor,
                 fontSize = 19.sp,
+                fontFamily = OpenSans,
                 fontWeight = FontWeight.Bold
             )
         }
@@ -274,42 +275,31 @@ internal fun GlassButton(
 
 /** Bulatan centang "Remember me". */
 @Composable
-private fun RememberRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(
-        Modifier.clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null
-        ) { onChange(!checked) },
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        val ring = Modifier.size(28.dp).clip(CircleShape)
-        Box(
-            if (checked) ring.background(GlassColors.Blue) else ring.border(2.dp, GlassColors.Blue, CircleShape),
-            contentAlignment = Alignment.Center
-        ) {
-            if (checked) {
-                Canvas(Modifier.size(15.dp)) {
-                    val tick = Path().apply {
-                        moveTo(size.width * 0.1f, size.height * 0.55f)
-                        lineTo(size.width * 0.4f, size.height * 0.85f)
-                        lineTo(size.width * 0.92f, size.height * 0.18f)
-                    }
-                    drawPath(
-                        tick, Color.White,
-                        style = Stroke(width = size.width * 0.16f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                    )
-                }
+private fun RememberCircle(checked: Boolean, modifier: Modifier) {
+    val du = LocalDu.current
+    Canvas(modifier) {
+        val ring = du.dp(4f).toPx()
+        if (checked) {
+            drawCircle(GlassColors.Blue)
+            val tick = Path().apply {
+                moveTo(size.width * 0.27f, size.height * 0.52f)
+                lineTo(size.width * 0.44f, size.height * 0.68f)
+                lineTo(size.width * 0.74f, size.height * 0.32f)
             }
+            drawPath(
+                tick, Color.White,
+                style = Stroke(width = size.width * 0.09f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            )
+        } else {
+            drawCircle(GlassColors.Blue, radius = (size.minDimension - ring) / 2f, style = Stroke(width = ring))
         }
-        Spacer(Modifier.width(10.dp))
-        Text(label, color = Color.White, fontSize = 16.sp)
     }
 }
 
 /** Roda gigi kecil untuk tombol Language. Digambar sendiri karena ikon extended tidak dipakai di proyek ini. */
 @Composable
 private fun GearIcon(modifier: Modifier = Modifier, color: Color = Color.White) {
-    Canvas(modifier.size(20.dp)) {
+    Canvas(modifier) {
         val c = center
         val r = size.minDimension / 2f
         drawCircle(color, radius = r * 0.55f, center = c, style = Stroke(width = r * 0.34f))
@@ -328,19 +318,21 @@ private fun GearIcon(modifier: Modifier = Modifier, color: Color = Color.White) 
 
 @Composable
 private fun LanguageChip(modifier: Modifier = Modifier) {
+    val du = LocalDu.current
     var open by remember { mutableStateOf(false) }
     Row(
         modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(Color(0x66101820))
+            .height(du.dp(33.4f))
+            .clip(RoundedCornerShape(du.dp(4f)))
+            .background(Color(0x44000000))
             .clickable { open = true }
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .padding(start = du.dp(12f), end = du.dp(9.1f)),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Tulisan tetap "Language" di semua bahasa supaya mudah dicari
-        Text("Language", color = Color.White, fontSize = 14.sp)
-        Spacer(Modifier.width(6.dp))
-        GearIcon()
+        DText("Language", 24.2f, lineHeight = 28f)
+        Spacer(Modifier.width(du.dp(13.6f)))
+        GearIcon(Modifier.size(du.dp(29.2f)))
     }
     if (open) {
         val current by AppLanguage.code.collectAsState()
@@ -372,6 +364,89 @@ private fun LanguageChip(modifier: Modifier = Modifier) {
     }
 }
 
+// Area desain layar login: dari tepi atas judul sampai ruang pesan di bawah kartu
+private const val LOGIN_TOP = 190f
+private const val LOGIN_CARD_BOTTOM = 1160.3f
+
+/** Satu kolom isian beserta labelnya, di posisi desain. */
+@Composable
+private fun DesignField(
+    du: Du,
+    origin: Float,
+    label: String,
+    labelCapTop: Float,
+    fieldTop: Float,
+    value: String,
+    onValueChange: (String) -> Unit,
+    keyboardType: KeyboardType,
+    imeAction: ImeAction,
+    onDone: () -> Unit,
+    visualTransformation: VisualTransformation,
+    enabled: Boolean,
+) {
+    DTextAt(label, x = 128.7f, capTop = labelCapTop, size = 28.5f, origin = origin)
+    Box(
+        fieldSurface(du, Modifier.at(du, 123.7f, fieldTop - origin).size(du.dp(566.3f), du.dp(87f)))
+            .padding(start = du.dp(29.8f), end = du.dp(76f)),
+        contentAlignment = Alignment.CenterStart
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            enabled = enabled,
+            singleLine = true,
+            textStyle = TextStyle(color = Color.White, fontSize = du.sp(28.5f), fontFamily = OpenSans),
+            cursorBrush = SolidColor(Color.White),
+            visualTransformation = visualTransformation,
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.None,
+                keyboardType = keyboardType,
+                imeAction = imeAction
+            ),
+            keyboardActions = KeyboardActions(onDone = { onDone() }),
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+/** Isi kotak QR di kartu login: kode QR Steam, atau tanda menunggu, atau ajakan mencoba lagi. */
+@Composable
+private fun QrArea(du: Du, loading: Boolean, qrUrl: String?, qrFailed: Boolean, onRetry: () -> Unit) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        when {
+            loading -> CircularProgressIndicator(Modifier.size(du.dp(70f)), color = Color.White, strokeWidth = du.dp(5f))
+            qrUrl != null -> Box(
+                Modifier
+                    .size(du.dp(245f))
+                    .clip(RoundedCornerShape(du.dp(14f)))
+                    .background(Color.White)
+                    .padding(du.dp(16f))
+            ) {
+                QrCodeView(qrUrl, Modifier.fillMaxSize())
+            }
+            qrFailed -> Column(
+                Modifier.clickable(onClick = onRetry).padding(du.dp(16f)),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.steam_logo),
+                    contentDescription = null,
+                    alpha = 0.45f,
+                    modifier = Modifier.size(du.dp(110f))
+                )
+                Spacer(Modifier.height(du.dp(8f)))
+                DText(
+                    tr("Ketuk untuk memuat ulang", "Tap to reload"),
+                    21f,
+                    color = Color.White.copy(alpha = 0.8f),
+                    align = TextAlign.Center
+                )
+            }
+            else -> CircularProgressIndicator(Modifier.size(du.dp(70f)), color = Color.White, strokeWidth = du.dp(5f))
+        }
+    }
+}
+
 @Composable
 fun LoginScreen(
     loading: Boolean,
@@ -384,100 +459,109 @@ fun LoginScreen(
     remember: Boolean,
     onRemember: (Boolean) -> Unit,
     onLogin: () -> Unit,
+    qrUrl: String?,
+    qrFailed: Boolean,
+    onRetryQr: () -> Unit,
 ) {
     var passwordVisible by remember { mutableStateOf(false) }
     val canLogin = !loading && username.isNotBlank() && password.isNotBlank()
+    val t = LOGIN_TOP
 
     GlassBackground {
+        val du = LocalDu.current
         Column(
             Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 28.dp, vertical = 24.dp),
+                .systemBarsPadding()
+                .imePadding()
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Column(Modifier.widthIn(max = 420.dp).fillMaxWidth()) {
-                Text(
+            Box(Modifier.size(du.dp(810f), du.dp(LOGIN_CARD_BOTTOM + 150f - t))) {
+                DTextAt(
                     tr("Login ke akun Steam kamu", "Login to your Steam account"),
-                    color = Color.White,
-                    fontSize = 27.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(start = 4.dp)
+                    x = 91.2f, capTop = 198.6f, size = 42.3f, origin = t, width = 700f, bold = true,
+                    shadow = Shadow(Color(0x66000000), Offset(0f, 3f), 10f)
                 )
-                Spacer(Modifier.height(20.dp))
-                GlassCard(Modifier.fillMaxWidth()) {
-                    Box(
-                        fieldSurface(Modifier.align(Alignment.CenterHorizontally).size(width = 118.dp, height = 112.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Image(
-                            painter = painterResource(R.drawable.steam_logo),
-                            contentDescription = null,
-                            modifier = Modifier.size(72.dp)
-                        )
-                    }
-                    Spacer(Modifier.height(18.dp))
-                    GlassField(
-                        label = "Nickname",
-                        value = username,
-                        onValueChange = onUsername,
-                        enabled = !loading,
-                        supporting = tr(
-                            "Nama akun untuk login Steam, bukan nama profil.",
-                            "The account name you log in to Steam with, not your profile name."
-                        )
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    GlassField(
-                        label = "Password",
-                        value = password,
-                        onValueChange = onPassword,
-                        keyboardType = KeyboardType.Password,
-                        imeAction = ImeAction.Done,
-                        onDone = { if (canLogin) onLogin() },
-                        visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                        enabled = !loading,
-                        trailing = {
-                            Box(
-                                Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .clickable { passwordVisible = !passwordVisible },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                CompositionLocalProvider(LocalContentColor provides Color.White) {
-                                    EyeIcon(visible = passwordVisible)
-                                }
-                            }
-                        }
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    RememberRow("Remember me", remember, onRemember)
+                GlassPanel(Modifier.at(du, 81f, 264.4f - t).size(du.dp(648f), du.dp(895.9f))) {}
 
+                Box(
+                    fieldSurface(du, Modifier.at(du, 257.8f, 296.3f - t).size(du.dp(298.1f), du.dp(281.1f)))
+                ) {
+                    QrArea(du, loading, qrUrl, qrFailed, onRetryQr)
+                }
+                DTextAt(
+                    tr("Pindai dengan aplikasi Steam Mobile", "Scan with the Steam Mobile app"),
+                    x = 81f, capTop = 598f, size = 20f, origin = t, width = 648f,
+                    color = Color.White.copy(alpha = 0.65f), align = TextAlign.Center
+                )
+
+                DesignField(
+                    du, t, "Nickname", 643.2f, 680.9f, username, onUsername,
+                    KeyboardType.Text, ImeAction.Next, {}, VisualTransformation.None, !loading
+                )
+                DesignField(
+                    du, t, "Password", 802.7f, 840.5f, password, onPassword,
+                    KeyboardType.Password, ImeAction.Done, { if (canLogin) onLogin() },
+                    if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    !loading
+                )
+                Box(
+                    Modifier
+                        .at(du, 609.9f, 857.6f - t)
+                        .size(du.dp(53f))
+                        .clip(CircleShape)
+                        .clickable { passwordVisible = !passwordVisible },
+                    contentAlignment = Alignment.Center
+                ) {
+                    CompositionLocalProvider(LocalContentColor provides Color.White) {
+                        EyeIcon(visible = passwordVisible, modifier = Modifier.size(du.dp(40f)))
+                    }
+                }
+
+                val rememberTop = 950f
+                Box(
+                    Modifier
+                        .at(du, 128.7f, rememberTop - t)
+                        .size(du.dp(320f), du.dp(50f))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { onRemember(!remember) }
+                ) {
+                    RememberCircle(remember, Modifier.at(du, 0f, 4.6f).size(du.dp(40.6f)))
+                    DTextAt("Remember me", x = 49.6f, capTop = 964.8f, size = 28.5f, origin = rememberTop)
+                }
+
+                DesignButton(
+                    text = tr("Kirim", "Send"),
+                    onClick = onLogin,
+                    modifier = Modifier.at(du, 123.7f, 1038.3f - t).size(du.dp(566.3f), du.dp(80.7f)),
+                    textSize = 36.3f, radius = 20f, bold = true,
+                    enabled = canLogin, loading = loading,
+                    activeColor = GlassColors.Blue, idleColor = GlassColors.BlueIdle, idleTextColor = GlassColors.BlueIdleText
+                )
+
+                Column(Modifier.at(du, 81f, LOGIN_CARD_BOTTOM + 24f - t).width(du.dp(648f))) {
                     error?.let {
-                        Spacer(Modifier.height(12.dp))
                         // SelectionContainer supaya teks error bisa disalin dan dikirim ke pengembang
                         SelectionContainer {
-                            Text(it, color = GlassColors.Error, fontSize = 13.sp)
+                            DText(it, 22f, color = GlassColors.Error, lineHeight = 30f)
                         }
                     }
                     status?.let {
-                        Spacer(Modifier.height(12.dp))
-                        Text(it, color = Color.White.copy(alpha = 0.85f), fontSize = 13.sp)
+                        DText(it, 22f, color = Color.White.copy(alpha = 0.85f), lineHeight = 30f)
                     }
-
-                    Spacer(Modifier.height(18.dp))
-                    GlassButton(
-                        text = tr("Kirim", "Send"),
-                        onClick = onLogin,
-                        enabled = canLogin,
-                        loading = loading
-                    )
                 }
             }
         }
-        LanguageChip(Modifier.align(Alignment.BottomEnd).padding(16.dp))
+        LanguageChip(
+            Modifier
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(end = du.dp(81f), bottom = du.dp(88.9f))
+        )
     }
 }
 
@@ -485,67 +569,93 @@ private const val CODE_LENGTH = 5
 private const val GUARD_WAIT_SECONDS = 180L
 
 /** Kotak-kotak kode Steam Guard. Satu kolom teks tak terlihat menampung ketikan, kotaknya hanya menampilkan. */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
-private fun CodeBoxes(code: String, enabled: Boolean, hasError: Boolean, onCodeChange: (String) -> Unit) {
+private fun CodeBoxes(
+    du: Du,
+    code: String,
+    enabled: Boolean,
+    hasError: Boolean,
+    modifier: Modifier,
+    onCodeChange: (String) -> Unit,
+    onDone: () -> Unit,
+) {
     val focus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
     var focused by remember { mutableStateOf(false) }
     LaunchedEffect(enabled) {
-        if (enabled) runCatching { focus.requestFocus() }
+        if (enabled) {
+            runCatching { focus.requestFocus() }
+            delay(150L)
+            keyboard?.show()
+        }
     }
-    BasicTextField(
-        value = code,
-        onValueChange = { raw ->
-            onCodeChange(raw.filter { it.isLetterOrDigit() }.uppercase(Locale.US).take(CODE_LENGTH))
-        },
-        enabled = enabled,
-        singleLine = true,
-        textStyle = TextStyle(color = Color.Transparent),
-        cursorBrush = SolidColor(Color.Transparent),
-        keyboardOptions = KeyboardOptions(
-            capitalization = KeyboardCapitalization.Characters,
-            keyboardType = KeyboardType.Ascii,
-            imeAction = ImeAction.Done
-        ),
-        modifier = Modifier
-            .fillMaxWidth()
-            .focusRequester(focus)
-            .onFocusChanged { focused = it.isFocused },
-        decorationBox = {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val shape = RoundedCornerShape(14.dp)
-                repeat(CODE_LENGTH) { i ->
-                    val active = focused && enabled && i == code.length.coerceAtMost(CODE_LENGTH - 1)
-                    val borderColor = when {
-                        hasError -> GlassColors.Red
-                        active -> GlassColors.Purple
-                        else -> Color(0x33FFFFFF)
-                    }
-                    Box(
-                        Modifier
-                            .weight(1f)
-                            .aspectRatio(0.85f)
-                            .clip(shape)
-                            .background(Brush.verticalGradient(listOf(Color(0xFF1D2A46), Color(0xFF2A2563))))
-                            .border(if (active) 2.dp else 1.dp, borderColor, shape),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            code.getOrNull(i)?.toString() ?: "",
-                            color = Color.White,
-                            fontSize = 26.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+    // Pegangan kursor sistem disembunyikan, supaya tidak muncul bulatan abu-abu di atas kotak
+    CompositionLocalProvider(
+        LocalTextSelectionColors provides TextSelectionColors(
+            handleColor = Color.Transparent,
+            backgroundColor = Color.Transparent
+        )
+    ) {
+        BasicTextField(
+            value = code,
+            onValueChange = { raw ->
+                onCodeChange(raw.filter { it.isLetterOrDigit() }.uppercase(Locale.US).take(CODE_LENGTH))
+            },
+            enabled = enabled,
+            singleLine = true,
+            textStyle = TextStyle(color = Color.Transparent),
+            cursorBrush = SolidColor(Color.Transparent),
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.Characters,
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.Done
+            ),
+            keyboardActions = KeyboardActions(onDone = { onDone() }),
+            modifier = modifier
+                .focusRequester(focus)
+                .onFocusChanged { focused = it.isFocused },
+            decorationBox = {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(du.dp(11.76f))) {
+                    val shape = RoundedCornerShape(du.dp(18f))
+                    repeat(CODE_LENGTH) { i ->
+                        val active = focused && enabled && i == code.length.coerceAtMost(CODE_LENGTH - 1)
+                        val borderColor = when {
+                            hasError -> GlassColors.Red
+                            active -> GlassColors.Purple
+                            else -> Color.Transparent
+                        }
+                        Box(
+                            Modifier
+                                .size(du.dp(75.8f), du.dp(83f))
+                                .clip(shape)
+                                .background(Brush.verticalGradient(listOf(Color(0xFF19273A), Color(0xFF342B68))))
+                                .border(du.dp(2.5f), borderColor, shape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            DText(
+                                code.getOrNull(i)?.toString() ?: "",
+                                48.6f,
+                                bold = true,
+                                lineHeight = 62f,
+                                align = TextAlign.Center
+                            )
+                        }
                     }
                 }
             }
-        }
-    )
+        )
+    }
 }
 
+// Area desain layar Steam Guard: dari tepi atas perisai sampai ruang pesan di bawah kartu
+private const val GUARD_TOP = 300f
+private const val GUARD_CARD_BOTTOM = 1007f
+
 /**
- * Layar Steam Guard: kode diketik di kotak (terkirim otomatis begitu lengkap), atau login disetujui di aplikasi
- * Steam Mobile. Tombol kirim ulang aktif setelah 3 menit atau saat waktu menunggu habis, dan baru saat ditekan
- * Steam diminta membuat persetujuan baru.
+ * Layar Steam Guard: kode diketik di kotak lalu dikirim dengan tombol Kirim, atau login disetujui di aplikasi
+ * Steam Mobile. Selama kotak belum penuh, tombol menjadi hitung mundur kirim ulang. Baru saat tombol kirim ulang
+ * ditekan Steam diminta membuat persetujuan baru.
  */
 @Composable
 fun GuardScreen(
@@ -573,6 +683,7 @@ fun GuardScreen(
     val canResend = !state.loading && (state.guardExpired || remaining <= 0L)
     val inputEnabled = !state.loading && !state.guardExpired
     val countdown = String.format(Locale.US, "%d:%02d", remaining / 60L, remaining % 60L)
+    val full = code.length == CODE_LENGTH && inputEnabled
 
     val hint = when {
         state.guardExpired -> tr(
@@ -593,71 +704,76 @@ fun GuardScreen(
         )
     }
     val wrongText = tr("Kode salah, coba lagi.", "Wrong code, try again.")
-    val resendText = if (canResend) tr("Kirim ulang", "Resend")
-    else tr("Kirim ulang kode dalam $countdown", "Resend code in $countdown")
+    val buttonText = when {
+        full -> tr("Kirim", "Send")
+        canResend -> tr("Kirim ulang", "Resend")
+        else -> tr("Kirim ulang kode dalam $countdown", "Resend code in $countdown")
+    }
+    val t = GUARD_TOP
 
     GlassBackground {
+        val du = LocalDu.current
         Column(
             Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 28.dp, vertical = 24.dp),
+                .systemBarsPadding()
+                .imePadding()
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Image(
-                painter = painterResource(R.drawable.steam_shield),
-                contentDescription = null,
-                modifier = Modifier.size(width = 124.dp, height = 144.dp)
-            )
-            Spacer(Modifier.height(24.dp))
-            GlassCard(Modifier.widthIn(max = 420.dp).fillMaxWidth()) {
+            Box(Modifier.size(du.dp(810f), du.dp(GUARD_CARD_BOTTOM + 150f - t))) {
+                Image(
+                    painter = painterResource(R.drawable.steam_shield),
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.at(du, 303.4f, 312f - t).size(du.dp(203.2f), du.dp(243.8f))
+                )
+                GlassPanel(Modifier.at(du, 81f, 589f - t).size(du.dp(648f), du.dp(418f))) {}
+
+                // Lima kotak (kode Steam Guard 5 karakter), ukuran tiap kotak sama dengan desain dan rata tengah kartu
                 CodeBoxes(
+                    du = du,
                     code = code,
                     enabled = inputEnabled,
                     hasError = state.wrongCode,
-                    onCodeChange = { c ->
-                        code = c
-                        if (c.length == CODE_LENGTH) onSubmit(c)
+                    modifier = Modifier.at(du, 192f, 640.4f - t).width(du.dp(426f)),
+                    onCodeChange = { code = it },
+                    onDone = { if (full) onSubmit(code) }
+                )
+                DTextAt(
+                    hint, x = 156.5f, capTop = 765.6f, size = 26.1f, origin = t, width = 497f,
+                    lineHeight = 36.6f, align = TextAlign.Center, maxLines = 3
+                )
+                DesignButton(
+                    text = buttonText,
+                    onClick = { if (full) onSubmit(code) else onResend() },
+                    modifier = Modifier.at(du, 156.5f, 898.3f - t).size(du.dp(497f), du.dp(70.8f)),
+                    textSize = 26.1f, radius = 22f, bold = false,
+                    enabled = full || canResend, loading = state.loading,
+                    activeColor = GlassColors.Purple, idleColor = GlassColors.PurpleIdle,
+                    idleTextColor = Color.White
+                )
+
+                Column(
+                    Modifier.at(du, 81f, GUARD_CARD_BOTTOM + 24f - t).width(du.dp(648f)),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (state.wrongCode && !state.loading) {
+                        DText(wrongText, 24f, color = GlassColors.Error, lineHeight = 32f)
                     }
-                )
-                Spacer(Modifier.height(18.dp))
-                Text(
-                    hint,
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (state.wrongCode && !state.loading) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(wrongText, color = GlassColors.Error, fontSize = 14.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
-                }
-                state.error?.let {
-                    Spacer(Modifier.height(8.dp))
-                    SelectionContainer {
-                        Text(it, color = GlassColors.Error, fontSize = 13.sp)
+                    state.error?.let {
+                        SelectionContainer {
+                            DText(it, 22f, color = GlassColors.Error, lineHeight = 30f)
+                        }
+                    }
+                    state.status?.let {
+                        DText(
+                            it, 22f, color = Color.White.copy(alpha = 0.85f), lineHeight = 30f,
+                            align = TextAlign.Center
+                        )
                     }
                 }
-                state.status?.let {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        it,
-                        color = Color.White.copy(alpha = 0.85f),
-                        fontSize = 13.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                Spacer(Modifier.height(18.dp))
-                GlassButton(
-                    text = resendText,
-                    onClick = onResend,
-                    enabled = canResend,
-                    activeColor = GlassColors.Purple,
-                    idleColor = Color(0xFF16202D),
-                    idleTextColor = Color.White.copy(alpha = 0.9f)
-                )
             }
         }
     }
@@ -690,32 +806,47 @@ private fun openNotificationSettings(context: Context) {
     }
 }
 
+/** Saklar sesuai desain: jalur 85,5 x 53,4 dengan tombol bulat. Area ketuknya setinggi kotak 85,5 di desain. */
 @Composable
-private fun PermissionRow(text: String, checked: Boolean, onToggle: () -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(text, color = Color.White, fontSize = 17.sp, modifier = Modifier.weight(1f))
-        Spacer(Modifier.width(14.dp))
-        Switch(
-            checked = checked,
-            onCheckedChange = { onToggle() },
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color(0xFFF4F4F8),
-                checkedTrackColor = Color(0xFF614AE3),
-                checkedBorderColor = Color.Transparent,
-                uncheckedThumbColor = Color(0xFFF8F9FB),
-                uncheckedTrackColor = GlassColors.Red,
-                uncheckedBorderColor = Color.Transparent
+private fun DesignToggle(checked: Boolean, onClick: () -> Unit, modifier: Modifier) {
+    val du = LocalDu.current
+    Box(
+        modifier
+            .size(du.dp(85.5f), du.dp(85.3f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            Modifier
+                .size(du.dp(85.5f), du.dp(53.4f))
+                .clip(CircleShape)
+                .background(if (checked) GlassColors.ToggleOn else GlassColors.Red)
+        ) {
+            Box(
+                Modifier
+                    .offset(x = du.dp(if (checked) 85.5f - 5.3f - 42.8f else 5.3f), y = du.dp(5.3f))
+                    .size(du.dp(42.8f))
+                    .clip(CircleShape)
+                    .background(Color(0xFFF9F9F9))
             )
-        )
+        }
     }
 }
 
+// Area desain layar izin: dari tepi atas ikon sampai di bawah kartu
+private const val PERM_TOP = 380f
+
 /**
- * Layar izin di awal. Saklar penyimpanan mengikuti izin "akses semua file" yang sebenarnya, dan membuka
- * pengaturan saat diketuk. Notifikasi bersifat opsional. Tombol Lanjutkan muncul setelah izin penyimpanan aktif.
+ * Layar izin, setelah kode Steam Guard. Saklar penyimpanan mengikuti izin "akses semua file" yang sebenarnya, dan
+ * membuka pengaturan saat diketuk. Notifikasi bersifat opsional. Begitu izin penyimpanan menyala, pop-up info
+ * penyimpanan muncul di atas layar ini (lihat StoragePopup), dan [blurred] mengaburkan layar ini di belakangnya.
  */
 @Composable
-fun PermissionScreen(storageGranted: Boolean, onContinue: () -> Unit) {
+fun PermissionScreen(storageGranted: Boolean, blurred: Boolean) {
     val context = LocalContext.current
     var notifOn by remember { mutableStateOf(NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     var notifAsked by remember { mutableStateOf(false) }
@@ -733,66 +864,72 @@ fun PermissionScreen(storageGranted: Boolean, onContinue: () -> Unit) {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
+    val t = PERM_TOP
 
-    GlassBackground {
-        Column(
-            Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 28.dp, vertical = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Image(
-                painter = painterResource(R.drawable.ic_user_key),
-                contentDescription = null,
-                modifier = Modifier.size(width = 120.dp, height = 128.dp)
-            )
-            Spacer(Modifier.height(24.dp))
-            GlassCard(Modifier.widthIn(max = 420.dp).fillMaxWidth()) {
-                Text(
-                    tr("Izinkan", "Allow"),
-                    color = Color.White,
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.height(14.dp))
-                PermissionRow(
-                    text = tr(
-                        "Beri izin aplikasi mengakses penyimpanan untuk menulis dan membaca data game",
-                        "Allow the app to access storage to write and read game data"
-                    ),
-                    checked = storageGranted,
-                    onToggle = { if (!storageGranted) openAllFilesAccessSettings(context) }
-                )
-                Spacer(Modifier.height(14.dp))
-                Box(Modifier.fillMaxWidth().height(2.dp).background(Color.White.copy(alpha = 0.9f)))
-                Spacer(Modifier.height(14.dp))
-                PermissionRow(
-                    text = tr("Berikan akses notifikasi (Opsional)", "Allow notification access (Optional)"),
-                    checked = notifOn,
-                    onToggle = {
-                        if (!notifOn) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notifAsked) {
-                                notifAsked = true
-                                notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                            } else {
-                                // Sistem tidak menampilkan dialog lagi setelah ditolak, jadi buka pengaturannya
-                                openNotificationSettings(context)
+    Box(if (blurred) Modifier.blur(18.dp) else Modifier) {
+        GlassBackground {
+            val du = LocalDu.current
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .systemBarsPadding()
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Box(Modifier.size(du.dp(810f), du.dp(992.2f + 40f - t))) {
+                    Image(
+                        painter = painterResource(R.drawable.ic_user_key),
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.at(du, 353.5f, 390.3f - t).size(du.dp(153f), du.dp(165f))
+                    )
+                    GlassPanel(Modifier.at(du, 81f, 589f - t).size(du.dp(648f), du.dp(403.2f))) {}
+
+                    DTextAt(
+                        tr("Izinkan", "Allow"),
+                        x = 137f, capTop = 629f, size = 42.3f, origin = t, width = 400f, bold = true,
+                        shadow = Shadow(Color(0x66000000), Offset(0f, 3f), 8f)
+                    )
+                    DTextAt(
+                        tr(
+                            "Beri izin aplikasi mengakses penyimpanan untuk menulis dan membaca data game",
+                            "Allow the app to access storage to write and read game data"
+                        ),
+                        x = 133f, capTop = 700f, size = 26.1f, origin = t, width = 376f, lineHeight = 36f
+                    )
+                    DesignToggle(
+                        checked = storageGranted,
+                        onClick = { if (!storageGranted) openAllFilesAccessSettings(context) },
+                        modifier = Modifier.at(du, 592.6f, 702.9f - t)
+                    )
+                    Box(
+                        Modifier
+                            .at(du, 133f, 830.6f - t)
+                            .size(du.dp(544.9f), du.dp(3f))
+                            .background(Color.White)
+                    )
+                    DTextAt(
+                        tr("Berikan akses notifikasi (Opsional)", "Allow notification access (Optional)"),
+                        x = 133f, capTop = 851.2f, size = 26.1f, origin = t, width = 376f, lineHeight = 36f
+                    )
+                    DesignToggle(
+                        checked = notifOn,
+                        onClick = {
+                            if (!notifOn) {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notifAsked) {
+                                    notifAsked = true
+                                    notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    // Sistem tidak menampilkan dialog lagi setelah ditolak, jadi buka pengaturannya
+                                    openNotificationSettings(context)
+                                }
                             }
-                        }
-                    }
-                )
-            }
-            if (storageGranted) {
-                Spacer(Modifier.height(20.dp))
-                GlassButton(
-                    text = tr("Lanjutkan", "Continue"),
-                    onClick = onContinue,
-                    modifier = Modifier.widthIn(max = 420.dp)
-                )
+                        },
+                        modifier = Modifier.at(du, 592.6f, 845.3f - t)
+                    )
+                }
             }
         }
-        LanguageChip(Modifier.align(Alignment.BottomEnd).padding(16.dp))
     }
 }

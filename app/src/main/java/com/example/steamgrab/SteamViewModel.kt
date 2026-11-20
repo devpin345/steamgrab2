@@ -22,6 +22,9 @@ import kotlinx.coroutines.withTimeout
 // Login dibuat longgar karena kadang menunggu kode Steam Guard dari email.
 private const val LOGIN_TIMEOUT_MS = 180_000L
 private const val GAMES_TIMEOUT_MS = 120_000L
+// Steam menutup sesi QR setelah beberapa menit tanpa dipindai, lalu QR baru dibuat. Batas ini hanya jaring pengaman.
+private const val QR_TIMEOUT_MS = 600_000L
+private const val QR_MAX_FAILURES = 3
 
 data class GameInfo(val appId: Int, val name: String)
 
@@ -93,6 +96,15 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _locationChoice = MutableStateFlow<LocationChoice?>(null)
     val locationChoice: StateFlow<LocationChoice?> = _locationChoice.asStateFlow()
+
+    // Kode QR di layar login. Null selama belum siap. qrFailed: gagal beberapa kali, pengguna bisa mencoba lagi.
+    private val _qrUrl = MutableStateFlow<String?>(null)
+    val qrUrl: StateFlow<String?> = _qrUrl.asStateFlow()
+
+    private val _qrFailed = MutableStateFlow(false)
+    val qrFailed: StateFlow<Boolean> = _qrFailed.asStateFlow()
+
+    private var qrJob: Job? = null
 
     private var ownedGames: List<GameInfo> = emptyList()
     private var watchingAppId: Int? = null
@@ -190,7 +202,88 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.value = UiState.LoggedOut()
     }
 
+    /**
+     * Menyiapkan kode QR untuk layar login, kalau belum ada yang berjalan dan tidak sedang login dengan kredensial.
+     * [remember] dibaca saat QR disetujui, supaya pilihan "Remember me" terakhir yang dipakai.
+     */
+    fun ensureQr(remember: () -> Boolean) {
+        if (qrJob?.isActive == true || loginJob?.isActive == true) return
+        runQr(remember)
+    }
+
+    /** Memuat ulang kode QR setelah gagal. */
+    fun retryQr(remember: () -> Boolean) {
+        qrJob?.cancel()
+        runQr(remember)
+    }
+
+    private fun runQr(remember: () -> Boolean) {
+        _qrFailed.value = false
+        _qrUrl.value = null
+        qrJob = viewModelScope.launch {
+            var failures = 0
+            while (isActive) {
+                try {
+                    withTimeout(QR_TIMEOUT_MS) {
+                        repo.loginWithQr(onChallenge = { _qrUrl.value = it }, remember = remember())
+                    }
+                } catch (e: Exception) {
+                    // Dibatalkan pengguna (login dengan kredensial menggantikan QR): bukan error
+                    if (e is CancellationException && e !is TimeoutCancellationException) throw e
+                    if (e is QrExpiredException || e is TimeoutCancellationException) {
+                        DebugLog.log("Kode QR kedaluwarsa, membuat yang baru")
+                        _qrUrl.value = null
+                        continue
+                    }
+                    failures++
+                    DebugLog.log("ERROR login QR ($failures): ${e.describe()}")
+                    if (failures >= QR_MAX_FAILURES) {
+                        _qrUrl.value = null
+                        _qrFailed.value = true
+                        return@launch
+                    }
+                    _qrUrl.value = null
+                    delay(2000L)
+                    continue
+                }
+
+                // QR dipindai dan disetujui di Steam Mobile
+                DebugLog.log("Login QR berhasil, lanjut mengambil daftar game")
+                _qrUrl.value = null
+                try {
+                    openGameList(fromGuard = false)
+                } catch (e: Exception) {
+                    if (e is CancellationException && e !is TimeoutCancellationException) throw e
+                    DebugLog.log("ERROR saat mengambil daftar game: ${e.describe()}")
+                    _qrFailed.value = true
+                    _uiState.value = UiState.LoggedOut(error = "Gagal saat mengambil daftar game.\nDetail:\n${e.describe()}")
+                }
+                return@launch
+            }
+        }
+    }
+
+    /** Mengambil daftar game setelah login berhasil, lalu membuka daftarnya. Layar login atau Steam Guard menunggu selama itu. */
+    private suspend fun openGameList(fromGuard: Boolean) {
+        _uiState.value = if (fromGuard) {
+            guardState(loading = true, status = "Mengambil daftar game...")
+        } else {
+            UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
+        }
+        val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGamesResilient() }
+        val games = owned.map { GameInfo(it.appId, it.name) }
+        ownedGames = games
+        watchingAppId = null
+        _uiState.value = UiState.GameList(games)
+        loadSizesInBackground(games)
+        loadPricesInBackground(games)
+    }
+
     private fun startLogin(username: String, password: String, remember: Boolean) {
+        // Login dengan kredensial menggantikan QR yang sedang menunggu
+        qrJob?.cancel()
+        qrJob = null
+        _qrUrl.value = null
         lastUser = username.trim()
         lastPass = password
         lastRemember = remember
@@ -229,18 +322,7 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 DebugLog.log("Login berhasil, lanjut mengambil daftar game")
                 step = "mengambil daftar game"
                 // Kalau login lewat layar Steam Guard, layarnya dipertahankan sampai daftar game siap
-                _uiState.value = if (guardSince != 0L) {
-                    guardState(loading = true, status = "Mengambil daftar game...")
-                } else {
-                    UiState.LoggedOut(loading = true, status = "Mengambil daftar game...")
-                }
-                val owned = withTimeout(GAMES_TIMEOUT_MS) { repo.loadOwnedGamesResilient() }
-                val games = owned.map { GameInfo(it.appId, it.name) }
-                ownedGames = games
-                watchingAppId = null
-                _uiState.value = UiState.GameList(games)
-                loadSizesInBackground(games)
-                loadPricesInBackground(games)
+                openGameList(fromGuard = guardSince != 0L)
             } catch (e: Exception) {
                 // Dibatalkan pengguna (Kirim ulang atau kembali): bukan error, dan layarnya sudah diatur oleh yang membatalkan
                 if (e is CancellationException && e !is TimeoutCancellationException) throw e

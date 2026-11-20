@@ -9,8 +9,7 @@ import android.os.Bundle
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.provider.Settings
-import android.view.Menu
-import android.view.MenuItem
+import android.app.Activity
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -32,6 +31,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -46,42 +46,36 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-
-private const val MENU_DEBUG = 1
 
 // Perbandingan lebar : tinggi gambar header Steam (460 x 215)
 private const val HEADER_RATIO = 460f / 215f
 
 class MainActivity : ComponentActivity() {
-    // Tombol Debug di pojok kanan atas (action bar)
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menu.add(0, MENU_DEBUG, 0, "Debug").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == MENU_DEBUG) {
-            DebugLog.setVisible(true)
-            return true
-        }
-        return super.onOptionsItemSelected(item)
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Tanpa action bar: isi layar sampai ke bawah status bar dan bilah navigasi, tiap layar mengatur sendiri jaraknya
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) window.isNavigationBarContrastEnforced = false
         DebugLog.init(applicationContext)
         AppLanguage.init(applicationContext)
         Libraries.init(applicationContext)
@@ -108,13 +102,10 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     val showDebug by DebugLog.visible.collectAsState()
     if (showDebug) DebugDialog(onClose = { DebugLog.setVisible(false) })
 
-    // Izin akses semua file diminta di awal, sebelum login dan sebelum daftar game muncul.
-    // Statusnya dicek ulang setiap aplikasi kembali ke layar (setelah pengguna dari pengaturan),
-    // jadi saklar di layar izin menyala sendiri begitu izin diberikan.
+    // Urutan layar: login, kode Steam Guard, izin, info penyimpanan (pop-up), lalu daftar game.
+    // Izin akses semua file diminta setelah login berhasil. Statusnya dicek ulang setiap aplikasi kembali ke layar
+    // (setelah pengguna dari pengaturan), jadi saklar di layar izin menyala sendiri begitu izin diberikan.
     var hasAccess by remember { mutableStateOf(Storage.hasAllFilesAccess()) }
-    // Layar izin dilewati kalau izin sudah ada sejak awal. Kalau baru diberikan di layar itu, pengguna menekan Lanjutkan
-    // (supaya sempat memilih izin notifikasi yang opsional). Kalau izin dicabut kemudian, layarnya muncul lagi.
-    var setupDone by remember { mutableStateOf(hasAccess) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -123,79 +114,122 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    LaunchedEffect(hasAccess) { if (!hasAccess) setupDone = false }
 
     // Isian login disimpan di sini, bukan di layar login, supaya tidak hilang saat layar berganti ke Steam Guard
     // dan kembali (misalnya setelah login gagal).
     var loginUser by remember { mutableStateOf(vm.savedAccount() ?: "") }
     var loginPass by remember { mutableStateOf("") }
     var loginRemember by remember { mutableStateOf(vm.rememberChoice()) }
+    val qrUrl by vm.qrUrl.collectAsState()
+    val qrFailed by vm.qrFailed.collectAsState()
 
-    // Pilihan penyimpanan ditampilkan sekali setelah izin. Layar yang sama bisa dibuka lagi dari daftar game.
-    var storageSetupDone by remember { mutableStateOf(Libraries.setupDone) }
+    // Pop-up info penyimpanan muncul setelah izin menyala, dan bisa dibuka lagi dari daftar game.
+    var setupFinished by remember { mutableStateOf(Libraries.setupDone) }
     var showStorage by remember { mutableStateOf(false) }
 
-    if (!hasAccess || !setupDone) {
-        PermissionScreen(storageGranted = hasAccess, onContinue = { setupDone = true })
-        return
-    }
-    if (!storageSetupDone) {
-        StorageScreen(setup = true, onDone = {
-            Libraries.setupDone = true
-            storageSetupDone = true
-        })
-        return
-    }
-    if (showStorage) {
-        StorageScreen(setup = false, onDone = { showStorage = false })
-        return
+    val current = state
+    val loggedOut = current is UiState.LoggedOut
+    val needsSetup = !loggedOut && (!hasAccess || !setupFinished)
+    // Layar login, Steam Guard, dan izin berlatar gelap, jadi ikon status bar dibuat terang
+    val darkScreen = loggedOut || needsSetup
+    val view = LocalView.current
+    SideEffect {
+        val window = (view.context as? Activity)?.window
+        if (window != null) {
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.isAppearanceLightStatusBars = !darkScreen
+            controller.isAppearanceLightNavigationBars = !darkScreen
+        }
     }
 
-    when (val s = state) {
-        is UiState.LoggedOut -> if (s.needsGuardCode) {
-            GuardScreen(
-                state = s,
-                onSubmit = { code -> vm.login(loginUser, loginPass, code, loginRemember) },
-                onResend = { vm.resendGuard() },
-                onBack = { vm.cancelLogin() }
-            )
+    Box(Modifier.fillMaxSize()) {
+        if (current is UiState.LoggedOut) {
+            if (current.needsGuardCode) {
+                GuardScreen(
+                    state = current,
+                    onSubmit = { code -> vm.login(loginUser, loginPass, code, loginRemember) },
+                    onResend = { vm.resendGuard() },
+                    onBack = { vm.cancelLogin() }
+                )
+            } else {
+                // QR disiapkan saat layar login tampil, dan dibuat lagi setelah login dengan kredensial gagal
+                LaunchedEffect(current.loading) {
+                    if (!current.loading) {
+                        delay(400L)
+                        vm.ensureQr { loginRemember }
+                    }
+                }
+                LoginScreen(
+                    loading = current.loading,
+                    error = current.error,
+                    status = current.status,
+                    username = loginUser,
+                    onUsername = { loginUser = it },
+                    password = loginPass,
+                    onPassword = { loginPass = it },
+                    remember = loginRemember,
+                    onRemember = { loginRemember = it },
+                    onLogin = { vm.login(loginUser, loginPass, null, loginRemember) },
+                    qrUrl = qrUrl,
+                    qrFailed = qrFailed,
+                    onRetryQr = { vm.retryQr { loginRemember } }
+                )
+            }
+        } else if (needsSetup) {
+            PermissionScreen(storageGranted = hasAccess, blurred = hasAccess)
+            if (hasAccess) {
+                StoragePopup(setup = true, onDone = {
+                    Libraries.setupDone = true
+                    setupFinished = true
+                })
+            }
         } else {
-            LoginScreen(
-                loading = s.loading,
-                error = s.error,
-                status = s.status,
-                username = loginUser,
-                onUsername = { loginUser = it },
-                password = loginPass,
-                onPassword = { loginPass = it },
-                remember = loginRemember,
-                onRemember = { loginRemember = it },
-                onLogin = { vm.login(loginUser, loginPass, null, loginRemember) }
-            )
+            // Layar biasa (latar putih): diberi jarak dari status bar dan ruang untuk tombol DEBUG di atas
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .then(if (showStorage) Modifier.blur(16.dp) else Modifier)
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+                    .padding(top = 28.dp)
+            ) {
+                when (current) {
+                    is UiState.GameList -> GameListScreen(
+                        games = current.games,
+                        sizes = sizes,
+                        sizesLoading = sizesLoading,
+                        free = prices,
+                        onSelect = { appId -> vm.requestDownload(appId) },
+                        onOpenDownload = { vm.openRunningDownload() },
+                        onOpenStorage = { showStorage = true }
+                    )
+                    is UiState.Downloading -> DownloadScreen(
+                        state = current,
+                        onPause = { vm.pauseDownload() },
+                        onResume = { appId -> vm.resumeDownload(appId) },
+                        onCancel = { vm.cancelDownload() },
+                        onBack = { vm.backToList() }
+                    )
+                    is UiState.Done -> DoneScreen(
+                        path = current.savedPath,
+                        onBack = { vm.backToList() }
+                    )
+                    is UiState.Error -> ErrorScreen(
+                        message = current.message,
+                        onBack = { vm.backToList() }
+                    )
+                    is UiState.LoggedOut -> Unit
+                }
+            }
+            if (showStorage) StoragePopup(onDone = { showStorage = false })
         }
-        is UiState.GameList -> GameListScreen(
-            games = s.games,
-            sizes = sizes,
-            sizesLoading = sizesLoading,
-            free = prices,
-            onSelect = { appId -> vm.requestDownload(appId) },
-            onOpenDownload = { vm.openRunningDownload() },
-            onOpenStorage = { showStorage = true }
-        )
-        is UiState.Downloading -> DownloadScreen(
-            state = s,
-            onPause = { vm.pauseDownload() },
-            onResume = { appId -> vm.resumeDownload(appId) },
-            onCancel = { vm.cancelDownload() },
-            onBack = { vm.backToList() }
-        )
-        is UiState.Done -> DoneScreen(
-            path = s.savedPath,
-            onBack = { vm.backToList() }
-        )
-        is UiState.Error -> ErrorScreen(
-            message = s.message,
-            onBack = { vm.backToList() }
+
+        // Tombol DEBUG menggantikan menu di action bar yang dihapus
+        DebugChip(
+            Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(top = 4.dp, end = 10.dp)
         )
     }
 
@@ -287,6 +321,20 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
                 )
             }
         )
+    }
+}
+
+/** Tombol kecil DEBUG yang selalu ada di pojok kanan atas, untuk membuka log. */
+@Composable
+private fun DebugChip(modifier: Modifier) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(50))
+            .background(Color(0x99000000))
+            .clickable { DebugLog.setVisible(true) }
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+    ) {
+        Text("DEBUG", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
     }
 }
 

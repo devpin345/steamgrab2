@@ -10,6 +10,8 @@ import `in`.dragonbra.javasteam.steam.authentication.AuthPollResult
 import `in`.dragonbra.javasteam.steam.authentication.AuthSessionDetails
 import `in`.dragonbra.javasteam.steam.authentication.AuthenticationException
 import `in`.dragonbra.javasteam.steam.authentication.IAuthenticator
+import `in`.dragonbra.javasteam.steam.authentication.IChallengeUrlChanged
+import `in`.dragonbra.javasteam.steam.authentication.QrAuthSession
 import `in`.dragonbra.javasteam.steam.authentication.CredentialsAuthSession
 import `in`.dragonbra.javasteam.protobufs.steamclient.SteammessagesAuthSteamclient.EAuthSessionGuardType
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.License
@@ -57,6 +59,9 @@ enum class GuardType { DEVICE, EMAIL, APPROVAL }
  * Depot yang dipilih untuk diunduh. [download] (terkompresi) dan [disk] (setelah dibuka) berasal dari info app
  * Steam dan null kalau info itu tidak memuatnya.
  */
+/** QR login kedaluwarsa sebelum dipindai. Layar login membuat QR baru, ini bukan error yang ditampilkan. */
+class QrExpiredException : Exception("Kode QR kedaluwarsa")
+
 data class DepotChoice(val depotId: Int, val manifestId: Long, val download: Long?, val disk: Long?)
 
 /** Keadaan satu depot dari listener library: byte terkompresi, byte tidak terkompresi, dan persennya (0..1). */
@@ -113,6 +118,11 @@ class SteamRepository private constructor(context: Context) {
     // Membuat sesi baru akan mengirim permintaan persetujuan baru ke Steam Mobile (dan email kode baru).
     @Volatile private var activeSession: CredentialsAuthSession? = null
     @Volatile private var awaitingApproval = false
+    // Login lewat kode QR: layar login menampilkan QR, dan login selesai saat QR dipindai lalu disetujui di Steam Mobile.
+    // Sesi QR dibuat sekali per percobaan, dan alamat QR-nya diperbarui Steam secara berkala ([onQrChallenge]).
+    @Volatile private var pendingQr = false
+    @Volatile private var qrSession: QrAuthSession? = null
+    @Volatile private var onQrChallenge: ((String) -> Unit)? = null
     // Nomor percobaan login. Naik setiap login baru dari tombol Login, sehingga sesi dan loop tunggu milik percobaan
     // lama berhenti sendiri. Sambung ulang otomatis tidak menaikkannya, jadi sesi yang sama dilanjutkan.
     private val authGeneration = AtomicInteger(0)
@@ -209,6 +219,9 @@ class SteamRepository private constructor(context: Context) {
         awaitingApproval = false
         pendingGuard?.cancel(false)
         pendingGuard = null
+        // Login dengan kredensial menggantikan QR yang sedang menunggu
+        pendingQr = false
+        qrSession = null
 
         pendingUser = username
         pendingPass = password
@@ -234,6 +247,46 @@ class SteamRepository private constructor(context: Context) {
         DebugLog.log("login: loggedOn diterima")
         licenseSignal.await()
         DebugLog.log("login: daftar lisensi diterima")
+    }
+
+    /**
+     * Login lewat kode QR. [onChallenge] dipanggil dengan alamat yang harus ditampilkan sebagai QR, pertama kali
+     * dan setiap Steam memperbaruinya. Selesai saat QR disetujui di aplikasi Steam Mobile dan daftar lisensi masuk.
+     * Gagal dengan [QrExpiredException] kalau QR kedaluwarsa sebelum dipindai.
+     */
+    suspend fun loginWithQr(onChallenge: (String) -> Unit, remember: Boolean) {
+        authGeneration.incrementAndGet()
+        pendingRemember = remember
+        loginRejected = false
+        activeSession = null
+        awaitingApproval = false
+        pendingGuard?.cancel(false)
+        pendingGuard = null
+        qrSession = null
+
+        pendingUser = null
+        pendingPass = null
+        pendingQr = true
+        onQrChallenge = onChallenge
+        onGuardNeeded = null
+        loggedOn = CompletableDeferred()
+        licenseSignal = CompletableDeferred()
+        sessionActive = false
+
+        DebugLog.log("login QR: mulai (sudah terhubung: $connected, sedang menyambung: $connecting)")
+        withContext(Dispatchers.IO) {
+            ensurePump()
+            if (connected) {
+                scope.launch { startSession() }
+            } else {
+                connectIfIdle()
+            }
+        }
+
+        loggedOn.await()
+        DebugLog.log("login QR: loggedOn diterima")
+        licenseSignal.await()
+        DebugLog.log("login QR: daftar lisensi diterima")
     }
 
     /** Menyambung ke Steam kalau belum tersambung dan belum ada percobaan sambung yang berjalan. */
@@ -302,6 +355,7 @@ class SteamRepository private constructor(context: Context) {
     fun abortLogin() {
         authGeneration.incrementAndGet()
         activeSession = null
+        qrSession = null
         awaitingApproval = false
         pendingGuard?.cancel(false)
         pendingGuard = null
@@ -907,7 +961,8 @@ class SteamRepository private constructor(context: Context) {
             val storedToken = prefs.getString(KEY_TOKEN, null)
             val typedUser = pendingUser
 
-            if (pendingRemember && storedAccount != null && storedToken != null &&
+            // Login QR selalu memakai akun yang memindai, bukan akun yang tersimpan
+            if (!pendingQr && pendingRemember && storedAccount != null && storedToken != null &&
                 (typedUser == null || typedUser.equals(storedAccount, ignoreCase = true))
             ) {
                 logOn(storedAccount, storedToken)
@@ -924,6 +979,20 @@ class SteamRepository private constructor(context: Context) {
                 authRunningGen = gen
             }
             try {
+                if (pendingQr) {
+                    val qrResult = awaitQrResult(gen)
+                    if (gen != authGeneration.get()) throw StaleLoginException()
+                    DebugLog.log("QR disetujui, token diterima")
+                    if (pendingRemember) {
+                        prefs.edit()
+                            .putString(KEY_ACCOUNT, qrResult.accountName)
+                            .putString(KEY_TOKEN, qrResult.refreshToken)
+                            .apply()
+                    }
+                    qrSession = null
+                    logOn(qrResult.accountName, qrResult.refreshToken)
+                    return
+                }
                 val existing = activeSession
                 val session = if (existing != null) {
                     DebugLog.log("Melanjutkan sesi login yang sama setelah tersambung lagi (tanpa permintaan baru)")
@@ -986,8 +1055,9 @@ class SteamRepository private constructor(context: Context) {
                 // Kredensial yang ditolak tidak dikirim lagi sampai pengguna menekan tombol login
                 loginRejected = true
                 pendingPass = null
+                val qrMode = pendingQr
                 val shown: Throwable = when (e.authRejection()?.result) {
-                    EResult.Expired -> IllegalStateException(
+                    EResult.Expired -> if (qrMode) QrExpiredException() else IllegalStateException(
                         "Permintaan persetujuan di Steam Mobile sudah kedaluwarsa. Tekan Login untuk meminta yang baru.",
                         e
                     )
@@ -1063,6 +1133,57 @@ class SteamRepository private constructor(context: Context) {
             if (gen != authGeneration.get()) throw StaleLoginException()
             val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).get() }
             if (result != null) return result
+            delay(intervalMs)
+        }
+    }
+
+    /**
+     * Membuat sesi QR (sekali per percobaan), menampilkan alamat QR-nya lewat [onQrChallenge], lalu memeriksa sesi
+     * secara berkala sampai QR dipindai dan disetujui di Steam Mobile. Jeda pemeriksaan mengikuti interval dari Steam,
+     * bukan penantian bawaan library (lihat [pollForApproval]). Koneksi yang putus tidak mengakhiri penantian.
+     */
+    private suspend fun awaitQrResult(gen: Int): AuthPollResult {
+        val session = qrSession ?: run {
+            val details = AuthSessionDetails().apply {
+                deviceFriendlyName = "SteamGrab Android"
+                persistentSession = true
+            }
+            DebugLog.log("Meminta kode QR login ke Steam...")
+            val created = withContext(Dispatchers.IO) { client.authentication.beginAuthSessionViaQR(details).get() }
+            if (gen != authGeneration.get()) throw StaleLoginException()
+            qrSession = created
+            created
+        }
+        session.challengeUrlChanged = IChallengeUrlChanged { s ->
+            s?.let { onQrChallenge?.invoke(it.challengeUrl) }
+        }
+        onQrChallenge?.invoke(session.challengeUrl)
+        DebugLog.log("Kode QR siap, menunggu dipindai di Steam Mobile")
+        val intervalMs = (session.pollingInterval * 1000f).toLong().coerceIn(2_000L, 5_000L)
+        var transientFailures = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            if (gen != authGeneration.get()) throw StaleLoginException()
+            if (!client.isConnected) {
+                delay(500L)
+                continue
+            }
+            try {
+                val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).get() }
+                if (result != null) return result
+                transientFailures = 0
+            } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
+                if (e is StaleLoginException) throw e
+                if (e.isConnectionLoss()) {
+                    DebugLog.log("Koneksi putus saat menunggu QR dipindai, sesi yang sama dilanjutkan setelah tersambung lagi")
+                    delay(1000L)
+                    continue
+                }
+                if (e.authRejection() != null || ++transientFailures > MAX_POLL_FAILURES) throw e
+                DebugLog.log("Gangguan sesaat saat menunggu QR ($transientFailures): ${e.describe()}")
+                delay(2000L)
+            }
             delay(intervalMs)
         }
     }

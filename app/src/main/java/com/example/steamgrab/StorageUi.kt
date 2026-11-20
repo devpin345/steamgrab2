@@ -4,10 +4,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,12 +26,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,7 +48,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
-// Layar Penyimpanan: library di tiap penyimpanan yang tersambung, dan pemilih folder bergaya Browse di Windows.
+// Info penyimpanan sebagai pop-up (sesuai desain): tiap penyimpanan yang tersambung dengan pemakaiannya, folder
+// library, dan game di dalamnya. Pemilih folder di bawah bergaya Browse di Windows.
 
 private val GAMES_COLOR = Color(0xFF614AE3)
 private val OTHER_COLOR = Color(0xFFADFF09)
@@ -48,14 +57,14 @@ private val FREE_COLOR = Color(0xFFC6CFD6)
 private val FOLDER_COLOR = Color(0xFFF5C451)
 
 /**
- * Daftar penyimpanan (memori internal, kartu SD, flashdisk) dengan pemakaian, folder library, dan game di dalamnya.
- * Dipakai sekali di awal ([setup]) dan bisa dibuka lagi dari daftar game untuk mengatur lokasi.
+ * Pop-up info penyimpanan di atas layar yang sedang tampil. Ketuk di luar kotak atau tombol kembali untuk menutup.
+ * [setup] true saat dipakai sekali setelah izin diberikan, supaya petunjuknya menyebut "lanjut".
  */
 @Composable
-fun StorageScreen(setup: Boolean, onDone: () -> Unit) {
+fun StoragePopup(onDone: () -> Unit, setup: Boolean = false) {
     val context = LocalContext.current
     val version by Libraries.version.collectAsState()
-    if (!setup) BackHandler(onBack = onDone)
+    BackHandler(onBack = onDone)
 
     // Dicek ulang saat kembali ke layar ini dan saat flashdisk atau kartu SD dipasang atau dilepas
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -104,63 +113,62 @@ fun StorageScreen(setup: Boolean, onDone: () -> Unit) {
     var blocked by remember { mutableStateOf(false) }
     var expandedId by remember { mutableStateOf<String?>(null) }
 
-    GlassBackground {
-        Column(
+    ProvideDu { du ->
+        Box(
             Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp, vertical = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .background(Color(0x66000000))
+                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onDone),
+            contentAlignment = Alignment.Center
         ) {
-            Column(Modifier.widthIn(max = 480.dp).fillMaxWidth()) {
-                Text(
-                    tr("Tempat menyimpan game", "Where to keep your games"),
-                    color = Color.White,
-                    fontSize = 26.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(start = 4.dp)
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    tr(
-                        "Tiap penyimpanan punya folder library sendiri. Game baru langsung disimpan ke penyimpanan " +
-                            "yang tersambung. Kalau ada lebih dari satu, kamu ditanya setiap kali mulai mengunduh.",
-                        "Each storage has its own library folder. New games are saved to the connected storage " +
-                            "automatically. If there is more than one, you are asked each time you start a download."
-                    ),
-                    color = Color.White.copy(alpha = 0.8f),
-                    fontSize = 14.sp,
-                    modifier = Modifier.padding(start = 4.dp)
-                )
-                Spacer(Modifier.height(18.dp))
-
-                volumes.forEach { volume ->
-                    VolumeCard(
-                        volume = volume,
-                        version = version,
-                        expanded = expandedId == volume.id,
-                        onToggle = { expandedId = if (expandedId == volume.id) null else volume.id },
-                        onPickFolder = { browsing = volume },
-                        onChangeBlocked = { blocked = true }
-                    )
-                    Spacer(Modifier.height(16.dp))
+            val maxCardHeight = (LocalConfiguration.current.screenHeightDp * 0.8f).dp
+            Column(Modifier.systemBarsPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
+                PopupPanel(
+                    Modifier
+                        .width(du.dp(665.6f))
+                        .heightIn(max = maxCardHeight)
+                        // Ketukan di dalam kotak tidak menutup pop-up
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
+                ) {
+                    Column(
+                        Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(start = du.dp(55.5f), end = du.dp(55.5f), top = du.dp(45.4f), bottom = du.dp(52f))
+                    ) {
+                        volumes.forEachIndexed { index, volume ->
+                            VolumeSection(
+                                volume = volume,
+                                version = version,
+                                expanded = expandedId == volume.id,
+                                last = index == volumes.lastIndex,
+                                onToggle = { expandedId = if (expandedId == volume.id) null else volume.id },
+                                onPickFolder = { browsing = volume },
+                                onChangeBlocked = { blocked = true }
+                            )
+                        }
+                    }
                 }
-                if (volumes.none { !it.primary }) {
-                    Text(
+                Spacer(Modifier.height(du.dp(26f)))
+                val closeHint = if (setup) {
+                    tr("Ketuk di luar kotak untuk lanjut.", "Tap outside the box to continue.")
+                } else {
+                    tr("Ketuk di luar kotak untuk menutup.", "Tap outside the box to close.")
+                }
+                val noRemovable = volumes.none { it.removable }
+                DText(
+                    if (noRemovable) {
                         tr(
-                            "Flashdisk atau kartu SD belum terdeteksi. Sambungkan, lalu daftarnya muncul di sini.",
-                            "No USB drive or SD card detected. Connect one and it will appear here."
-                        ),
-                        color = Color.White.copy(alpha = 0.7f),
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(horizontal = 4.dp)
-                    )
-                    Spacer(Modifier.height(16.dp))
-                }
-
-                GlassButton(
-                    text = if (setup) tr("Lanjutkan", "Continue") else tr("Kembali", "Back"),
-                    onClick = onDone
+                            "Flashdisk atau kartu SD belum terdeteksi. ",
+                            "No USB drive or SD card detected. "
+                        ) + closeHint
+                    } else {
+                        closeHint
+                    },
+                    21f,
+                    modifier = Modifier.width(du.dp(560f)),
+                    color = Color.White.copy(alpha = 0.75f),
+                    lineHeight = 30f,
+                    align = TextAlign.Center
                 )
             }
         }
@@ -203,15 +211,42 @@ fun StorageScreen(setup: Boolean, onDone: () -> Unit) {
     }
 }
 
+/** Kotak pop-up: kaca gelap dengan garis tepi putih di atas yang memudar ke ungu di bawah. */
 @Composable
-private fun VolumeCard(
+private fun PopupPanel(modifier: Modifier, content: @Composable BoxScope.() -> Unit) {
+    val du = LocalDu.current
+    val shape = RoundedCornerShape(du.dp(24f))
+    Box(
+        modifier = modifier
+            .clip(shape)
+            .background(Brush.verticalGradient(listOf(Color(0xEB1C2A40), Color(0xF0101A24))))
+            .border(
+                du.dp(2.5f),
+                Brush.verticalGradient(listOf(Color(0xFFE8E8F0), Color(0xFF5B45D6))),
+                shape
+            ),
+        content = content
+    )
+}
+
+@Composable
+private fun PopupDivider() {
+    val du = LocalDu.current
+    Box(Modifier.fillMaxWidth().height(du.dp(3f)).background(Color.White))
+}
+
+/** Satu penyimpanan: judul dan ikon, pemakaian, lalu folder library (atau ajakan menambahkannya) dan isinya. */
+@Composable
+private fun VolumeSection(
     volume: StorageVolumeInfo,
     version: Int,
     expanded: Boolean,
+    last: Boolean,
     onToggle: () -> Unit,
     onPickFolder: () -> Unit,
     onChangeBlocked: () -> Unit,
 ) {
+    val du = LocalDu.current
     val libDir = remember(version, volume.id) { Libraries.libraryDir(volume) }
     val games by produceState(emptyList<LibraryGame>(), libDir?.path, version) {
         value = withContext(Dispatchers.IO) { libDir?.let { Library(it).games() } ?: emptyList() }
@@ -222,117 +257,200 @@ private fun VolumeCard(
     val gamesBytes = games.sumOf { it.sizeOnDisk }.coerceAtMost(used)
     val other = (used - gamesBytes).coerceAtLeast(0L)
 
-    GlassCard(Modifier.fillMaxWidth()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            VolumeIcon(removable = volume.removable)
-            Spacer(Modifier.width(12.dp))
-            Text(
-                if (volume.primary) tr("Ponsel Kamu", "Your Phone") else volume.label,
-                color = Color.White,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
+    val isSdCard = volume.label.contains("sd", ignoreCase = true)
+    val title = when {
+        volume.primary -> "Disc"
+        isSdCard -> "SD Card"
+        else -> "USB Drive"
+    }
+    val subtitle = if (volume.primary) tr("Ponsel Kamu", "Your Phone") else "${volume.label} ${formatBytes(total)}".trim()
+
+    Column(Modifier.fillMaxWidth()) {
+        Box(Modifier.fillMaxWidth().height(du.dp(57.1f))) {
+            DText(title, 42.3f, bold = true, lineHeight = 57.1f, maxLines = 1)
+            Image(
+                painter = painterResource(if (volume.removable) R.drawable.ic_usb else R.drawable.ic_disc),
+                contentDescription = null,
+                alpha = if (volume.removable) 0.8f else 0.58f,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = -du.dp(13.4f), y = -du.dp(4f))
+                    .requiredSize(du.dp(if (volume.removable) 110f else 116f))
             )
-            Spacer(Modifier.width(8.dp))
-            Text(formatBytes(total), color = Color.White.copy(alpha = 0.85f), fontSize = 16.sp)
         }
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(du.dp(17.2f)))
+        DText(subtitle, 26.1f, lineHeight = 36.5f, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.height(du.dp(9.5f)))
         UsageBar(other = other, games = gamesBytes, free = free)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            tr(
-                "Terpakai : ${formatBytes(used)}/${formatBytes(total)}    Kosong : ${formatBytes(free)}",
-                "Usage : ${formatBytes(used)}/${formatBytes(total)}    Free : ${formatBytes(free)}"
-            ),
-            color = Color.White,
-            fontSize = 14.sp
-        )
-        Spacer(Modifier.height(4.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            LegendDot(OTHER_COLOR, tr("File lain", "Other files"))
-            Spacer(Modifier.width(12.dp))
-            LegendDot(GAMES_COLOR, tr("Game SteamGrab", "SteamGrab games"))
-            Spacer(Modifier.width(12.dp))
-            LegendDot(FREE_COLOR, tr("Kosong", "Free"))
+        Spacer(Modifier.height(du.dp(3.6f)))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            DText(
+                tr(
+                    "Terpakai :${formatBytes(used)}/${formatBytes(total)}",
+                    "Usage :${formatBytes(used)}/${formatBytes(total)}"
+                ),
+                20.8f, lineHeight = 29.1f
+            )
+            DText(tr("Kosong: ${formatBytes(free)}", "Free: ${formatBytes(free)}"), 20.8f, lineHeight = 29.1f)
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(du.dp(13.4f)))
+        PopupDivider()
 
         if (libDir == null) {
-            OutlinedButton(onClick = onPickFolder, modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    "+ " + tr("Tambahkan alamat penyimpanan", "Add storage location"),
-                    color = Color.White
+            // Penyimpanan eksternal yang belum punya folder library
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onPickFolder)
+                    .padding(top = du.dp(42f)),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                PlusIcon(Modifier.size(du.dp(48f)))
+                Spacer(Modifier.height(du.dp(11f)))
+                DText(
+                    tr("Tambahkan alamat penyimpanan", "Add storage location"),
+                    26.1f, lineHeight = 36.5f, align = TextAlign.Center
                 )
             }
         } else {
+            Spacer(Modifier.height(du.dp(23.5f)))
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(onClick = onToggle)
-                    .padding(vertical = 6.dp),
+                    .height(du.dp(123f))
+                    .clickable(onClick = onToggle),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                FolderIcon(Modifier.size(34.dp))
-                Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(libDir.path, color = Color.White, fontSize = 15.sp)
-                    Text("${games.size} Game", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                Image(
+                    painter = painterResource(R.drawable.ic_folder),
+                    contentDescription = null,
+                    modifier = Modifier.padding(start = du.dp(3f)).size(du.dp(123f))
+                )
+                Spacer(Modifier.width(du.dp(40f)))
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
+                    DText(
+                        libDir.path.removePrefix("/storage/"),
+                        26.1f, lineHeight = 34f, maxLines = 2, overflow = TextOverflow.Ellipsis
+                    )
+                    DText(
+                        tr("${games.size} Game", "${games.size} Games"),
+                        22f, color = Color.White.copy(alpha = 0.8f), lineHeight = 30f
+                    )
                 }
-                Chevron(up = expanded)
             }
             if (expanded) {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(du.dp(15f)))
                 if (games.isEmpty()) {
-                    Text(
+                    DText(
                         tr("Belum ada game di library ini.", "No games in this library yet."),
-                        color = Color.White.copy(alpha = 0.7f),
-                        fontSize = 14.sp
+                        22f, color = Color.White.copy(alpha = 0.7f), lineHeight = 30f
                     )
                 } else {
-                    games.forEach { game -> LibraryGameRow(game) }
+                    games.forEach { game ->
+                        GameRow(game)
+                        Spacer(Modifier.height(du.dp(15f)))
+                    }
                 }
+                DText(
+                    tr("Ubah alamat", "Change location"),
+                    22f,
+                    modifier = Modifier
+                        .clickable(onClick = if (games.isEmpty()) onPickFolder else onChangeBlocked)
+                        .padding(vertical = du.dp(8f)),
+                    color = Color(0xFF8FB4FF),
+                    lineHeight = 30f
+                )
             }
-            TextButton(onClick = if (games.isEmpty()) onPickFolder else onChangeBlocked) {
-                Text(tr("Ubah alamat", "Change location"), color = Color(0xFF8FB4FF))
-            }
+        }
+        if (!last) {
+            Spacer(Modifier.height(du.dp(31.2f)))
+            PopupDivider()
+            Spacer(Modifier.height(du.dp(15f)))
         }
     }
 }
 
+/** Satu game di library: ikon persegi, nama, sistem operasi, dan ukurannya di disk. */
 @Composable
-private fun LibraryGameRow(game: LibraryGame) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        GameHeader(appId = game.appId, modifier = Modifier.width(76.dp))
-        Spacer(Modifier.width(12.dp))
+private fun GameRow(game: LibraryGame) {
+    val du = LocalDu.current
+    val platform = PlatformStore.get(game.appId) ?: Platform.WINDOWS
+    val platformIcon = when (platform) {
+        Platform.LINUX -> R.drawable.ic_linux
+        Platform.WINDOWS -> R.drawable.ic_windows
+        else -> null
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = du.dp(62.3f))
+            .clip(RoundedCornerShape(du.dp(12f)))
+            .background(Color(0x4D000000))
+            .padding(horizontal = du.dp(9f), vertical = du.dp(7f)),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        GameIcon(game.appId, Modifier.size(du.dp(46.5f)))
+        Spacer(Modifier.width(du.dp(8f)))
         Column(Modifier.weight(1f)) {
-            Text(
-                game.name,
-                color = Color.White,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
+            DText(
+                game.name, 21.7f, bold = true, lineHeight = 29f,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
             )
-            val platform = (PlatformStore.get(game.appId) ?: Platform.WINDOWS).label
-            val status = if (game.complete) "" else " · " + tr("Belum selesai", "Incomplete")
-            Text(platform + status, color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+            if (!game.complete) {
+                DText(
+                    tr("Belum selesai", "Incomplete"),
+                    15f, color = Color(0xFFFFC46B), lineHeight = 20f
+                )
+            }
         }
-        Spacer(Modifier.width(8.dp))
-        Text(formatBytes(game.sizeOnDisk), color = Color.White, fontSize = 14.sp)
+        Spacer(Modifier.width(du.dp(8f)))
+        Column(horizontalAlignment = Alignment.End) {
+            if (platformIcon != null) {
+                Image(
+                    painter = painterResource(platformIcon),
+                    contentDescription = null,
+                    alpha = 0.55f,
+                    modifier = Modifier.size(du.dp(21f))
+                )
+            }
+            DText(
+                formatBytes(game.sizeOnDisk), 16.4f,
+                color = Color.White.copy(alpha = 0.6f), lineHeight = 22f
+            )
+        }
+    }
+}
+
+/** Ikon game: bagian tengah gambar header Steam dipotong jadi persegi. */
+@Composable
+private fun GameIcon(appId: Int, modifier: Modifier) {
+    val du = LocalDu.current
+    val bitmap by produceState<Bitmap?>(initialValue = GameImages.cached(appId), key1 = appId) {
+        value = GameImages.load(appId)
+    }
+    val shape = RoundedCornerShape(du.dp(7f))
+    val b = bitmap
+    if (b != null) {
+        Image(
+            bitmap = b.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = modifier.clip(shape)
+        )
+    } else {
+        Box(modifier.clip(shape).background(Color(0x33FFFFFF)))
     }
 }
 
 @Composable
 private fun UsageBar(other: Long, games: Long, free: Long) {
+    val du = LocalDu.current
     val total = (other + games + free).coerceAtLeast(1L).toFloat()
     Row(
         Modifier
             .fillMaxWidth()
-            .height(14.dp)
-            .clip(RoundedCornerShape(7.dp))
+            .height(du.dp(15.6f))
+            .clip(RoundedCornerShape(du.dp(8f)))
             .background(FREE_COLOR)
     ) {
         if (other > 0L) Box(Modifier.weight((other / total).coerceAtLeast(0.001f)).fillMaxHeight().background(OTHER_COLOR))
@@ -342,40 +460,12 @@ private fun UsageBar(other: Long, games: Long, free: Long) {
 }
 
 @Composable
-private fun LegendDot(color: Color, text: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(9.dp).clip(RoundedCornerShape(5.dp)).background(color))
-        Spacer(Modifier.width(5.dp))
-        Text(text, color = Color.White.copy(alpha = 0.8f), fontSize = 12.sp)
-    }
-}
-
-/** Ikon ponsel (memori internal) atau flashdisk. Digambar sendiri karena ikon extended tidak dipakai di proyek ini. */
-@Composable
-private fun VolumeIcon(removable: Boolean, modifier: Modifier = Modifier) {
-    Canvas(modifier.size(40.dp)) {
-        val w = size.width
-        val h = size.height
-        val c = Color.White
-        if (!removable) {
-            drawRoundRect(
-                c,
-                topLeft = Offset(w * 0.27f, h * 0.04f),
-                size = Size(w * 0.46f, h * 0.92f),
-                cornerRadius = CornerRadius(w * 0.08f),
-                style = Stroke(width = w * 0.07f)
-            )
-            drawCircle(c, radius = w * 0.035f, center = Offset(w * 0.5f, h * 0.86f))
-        } else {
-            drawRoundRect(
-                c,
-                topLeft = Offset(w * 0.3f, h * 0.32f),
-                size = Size(w * 0.4f, h * 0.64f),
-                cornerRadius = CornerRadius(w * 0.06f),
-                style = Stroke(width = w * 0.07f)
-            )
-            drawRect(c, topLeft = Offset(w * 0.38f, h * 0.06f), size = Size(w * 0.24f, h * 0.26f))
-        }
+private fun PlusIcon(modifier: Modifier) {
+    Canvas(modifier) {
+        val t = size.minDimension * 0.19f
+        val r = CornerRadius(t * 0.3f)
+        drawRoundRect(Color.White, Offset((size.width - t) / 2f, 0f), Size(t, size.height), r)
+        drawRoundRect(Color.White, Offset(0f, (size.height - t) / 2f), Size(size.width, t), r)
     }
 }
 
@@ -396,26 +486,6 @@ private fun FolderIcon(modifier: Modifier = Modifier) {
             size = Size(w, h * 0.6f),
             cornerRadius = CornerRadius(w * 0.08f)
         )
-    }
-}
-
-@Composable
-private fun Chevron(up: Boolean) {
-    Canvas(Modifier.size(20.dp)) {
-        val w = size.width
-        val h = size.height
-        val path = Path().apply {
-            if (up) {
-                moveTo(w * 0.2f, h * 0.65f)
-                lineTo(w * 0.5f, h * 0.35f)
-                lineTo(w * 0.8f, h * 0.65f)
-            } else {
-                moveTo(w * 0.2f, h * 0.35f)
-                lineTo(w * 0.5f, h * 0.65f)
-                lineTo(w * 0.8f, h * 0.35f)
-            }
-        }
-        drawPath(path, Color.White, style = Stroke(width = w * 0.1f))
     }
 }
 

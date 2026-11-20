@@ -39,6 +39,8 @@ dependencies {
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"
 
     implementation "in.dragonbra:javasteam:1.8.0"
+    // Membuat kode QR untuk login lewat Steam Mobile
+    implementation "com.google.zxing:core:3.5.3"
     implementation "in.dragonbra:javasteam-depotdownloader:1.8.0"
     // Enum dari javasteam (EAuthSessionGuardType) mewarisi kelas protobuf. Tanpa ini kompilasi gagal.
     // Versi sama dengan yang dipakai library (gradle/libs.versions.toml di JavaSteam).
