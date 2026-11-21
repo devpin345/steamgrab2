@@ -122,6 +122,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     var loginRemember by remember { mutableStateOf(vm.rememberChoice()) }
     val qrUrl by vm.qrUrl.collectAsState()
     val qrFailed by vm.qrFailed.collectAsState()
+    val autoLogin by vm.autoLogin.collectAsState()
 
     // Pop-up info penyimpanan muncul setelah izin menyala, dan bisa dibuka lagi dari daftar game.
     var setupFinished by remember { mutableStateOf(Libraries.setupDone) }
@@ -144,7 +145,10 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
 
     Box(Modifier.fillMaxSize()) {
         if (current is UiState.LoggedOut) {
-            if (current.needsGuardCode) {
+            if (autoLogin) {
+                // Akun tersimpan ("Remember me"): masuk otomatis, tanpa layar login
+                AutoLoginScreen(status = current.status, onSwitchAccount = { vm.cancelAutoLogin() })
+            } else if (current.needsGuardCode) {
                 GuardScreen(
                     state = current,
                     onSubmit = { code -> vm.login(loginUser, loginPass, code, loginRemember) },

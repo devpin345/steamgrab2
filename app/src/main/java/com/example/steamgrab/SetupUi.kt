@@ -933,3 +933,46 @@ fun PermissionScreen(storageGranted: Boolean, blurred: Boolean) {
         }
     }
 }
+
+/** Layar tunggu saat masuk otomatis dengan akun yang tersimpan. "Ganti akun" membatalkan dan melupakan akun itu. */
+@Composable
+fun AutoLoginScreen(status: String?, onSwitchAccount: () -> Unit) {
+    GlassBackground {
+        val du = LocalDu.current
+        Column(
+            Modifier.fillMaxSize().systemBarsPadding(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Image(
+                painter = painterResource(R.drawable.steam_logo),
+                contentDescription = null,
+                modifier = Modifier.size(du.dp(170f))
+            )
+            Spacer(Modifier.height(du.dp(56f)))
+            CircularProgressIndicator(
+                color = Color.White,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(du.dp(60f))
+            )
+            Spacer(Modifier.height(du.dp(36f)))
+            DText(
+                status ?: tr("Masuk ke Steam...", "Signing in to Steam..."),
+                28f,
+                modifier = Modifier.padding(horizontal = du.dp(60f)),
+                align = TextAlign.Center
+            )
+        }
+        DText(
+            tr("Ganti akun", "Switch account"),
+            26f,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = du.dp(70f))
+                .clickable(onClick = onSwitchAccount)
+                .padding(du.dp(16f)),
+            color = Color(0xFF8FB4FF)
+        )
+    }
+}

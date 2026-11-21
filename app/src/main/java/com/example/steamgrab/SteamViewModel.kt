@@ -22,6 +22,7 @@ import kotlinx.coroutines.withTimeout
 // Login dibuat longgar karena kadang menunggu kode Steam Guard dari email.
 private const val LOGIN_TIMEOUT_MS = 180_000L
 private const val GAMES_TIMEOUT_MS = 120_000L
+private const val AUTO_LOGIN_TIMEOUT_MS = 45_000L
 // Steam menutup sesi QR setelah beberapa menit tanpa dipindai, lalu QR baru dibuat. Batas ini hanya jaring pengaman.
 private const val QR_TIMEOUT_MS = 600_000L
 private const val QR_MAX_FAILURES = 3
@@ -106,6 +107,11 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
 
     private var qrJob: Job? = null
 
+    // Sedang masuk otomatis dengan akun yang disimpan ("Remember me"). Selama true, layar menampilkan layar tunggu,
+    // bukan layar login.
+    private val _autoLogin = MutableStateFlow(repo.hasSavedLogin())
+    val autoLogin: StateFlow<Boolean> = _autoLogin.asStateFlow()
+
     private var ownedGames: List<GameInfo> = emptyList()
     private var watchingAppId: Int? = null
     private var sizeJob: Job? = null
@@ -127,6 +133,48 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             DownloadService.status.collect { onDownloadStatus(it) }
         }
+        if (_autoLogin.value) startSavedLogin()
+    }
+
+    /** Masuk dengan akun yang tersimpan, tanpa layar login dan tanpa Steam Guard. Kalau gagal, layar login tampil. */
+    private fun startSavedLogin() {
+        DebugLog.log("Masuk otomatis dengan akun tersimpan: ${repo.savedAccount()}")
+        _uiState.value = UiState.LoggedOut(loading = true, status = "Masuk ke Steam...")
+        loginJob = viewModelScope.launch {
+            var step = "masuk otomatis"
+            try {
+                withTimeout(AUTO_LOGIN_TIMEOUT_MS) { repo.loginWithSavedToken() }
+                DebugLog.log("Masuk otomatis berhasil, lanjut mengambil daftar game")
+                step = "mengambil daftar game"
+                openGameList(fromGuard = false)
+            } catch (e: Exception) {
+                if (e is CancellationException && e !is TimeoutCancellationException) throw e
+                DebugLog.log("ERROR saat $step: ${e.describe()}")
+                repo.abortLogin()
+                _uiState.value = UiState.LoggedOut(
+                    error = when {
+                        step != "masuk otomatis" -> "Gagal saat $step.\nDetail:\n${e.describe()}"
+                        e is TimeoutCancellationException ->
+                            "Masuk otomatis terlalu lama. Periksa koneksi internet, lalu buka aplikasi lagi atau login di sini."
+                        !repo.hasSavedLogin() -> "Sesi login yang tersimpan sudah tidak berlaku. Silakan login lagi."
+                        else -> "Tidak bisa masuk otomatis.\nDetail:\n${e.describe()}"
+                    }
+                )
+            } finally {
+                _autoLogin.value = false
+            }
+        }
+    }
+
+    /** Dari layar tunggu masuk otomatis: batalkan dan lupakan akun yang tersimpan, lalu tampilkan layar login. */
+    fun cancelAutoLogin() {
+        DebugLog.log("Masuk otomatis dibatalkan, akun tersimpan dilupakan")
+        loginJob?.cancel()
+        loginJob = null
+        repo.abortLogin()
+        repo.forgetSavedLogin()
+        _autoLogin.value = false
+        _uiState.value = UiState.LoggedOut()
     }
 
     fun savedAccount(): String? = repo.savedAccount()

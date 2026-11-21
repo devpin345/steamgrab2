@@ -180,8 +180,14 @@ class SteamRepository private constructor(context: Context) {
                 sessionActive = true
                 loggedOn.complete(Unit)
             } else {
-                // Token mungkin sudah tidak valid, hapus supaya login berikutnya minta kredensial lagi
-                prefs.edit().remove(KEY_TOKEN).remove(KEY_ACCOUNT).apply()
+                // Token yang ditolak Steam dihapus supaya login berikutnya minta kredensial lagi. Gangguan sementara
+                // (server sibuk, dan sebagainya) tidak menghapusnya, supaya pengguna tidak dipaksa login ulang.
+                if (cb.result.name in TOKEN_REJECTED_RESULTS) {
+                    prefs.edit().remove(KEY_TOKEN).remove(KEY_ACCOUNT).apply()
+                    DebugLog.log("Token tersimpan ditolak Steam dan dihapus")
+                }
+                // Sambungan yang diputus Steam setelah penolakan tidak disambung ulang otomatis
+                loginRejected = true
                 loggedOn.completeExceptionally(IllegalStateException("Login gagal: ${cb.result}"))
             }
         }
@@ -287,6 +293,57 @@ class SteamRepository private constructor(context: Context) {
         DebugLog.log("login QR: loggedOn diterima")
         licenseSignal.await()
         DebugLog.log("login QR: daftar lisensi diterima")
+    }
+
+    /** Ada akun dan token yang disimpan lewat "Remember me", jadi login bisa dilakukan tanpa kredensial. */
+    fun hasSavedLogin(): Boolean =
+        rememberChoice() && prefs.getString(KEY_ACCOUNT, null) != null && prefs.getString(KEY_TOKEN, null) != null
+
+    /** Melupakan akun yang tersimpan, supaya aplikasi meminta login lagi. */
+    fun forgetSavedLogin() {
+        prefs.edit().remove(KEY_TOKEN).remove(KEY_ACCOUNT).apply()
+    }
+
+    /**
+     * Masuk otomatis dengan akun dan token yang disimpan lewat "Remember me", tanpa kredensial dan tanpa Steam Guard.
+     * Selesai saat daftar lisensi masuk. Gagal kalau token ditolak Steam atau koneksi tidak tersedia.
+     */
+    suspend fun loginWithSavedToken() {
+        if (sessionActive && client.isConnected && licenses.isNotEmpty()) {
+            DebugLog.log("Masuk otomatis: sesi Steam sudah aktif")
+            return
+        }
+        authGeneration.incrementAndGet()
+        pendingRemember = true
+        loginRejected = false
+        activeSession = null
+        awaitingApproval = false
+        pendingGuard?.cancel(false)
+        pendingGuard = null
+        qrSession = null
+
+        pendingUser = null
+        pendingPass = null
+        pendingQr = false
+        onGuardNeeded = null
+        loggedOn = CompletableDeferred()
+        licenseSignal = CompletableDeferred()
+        sessionActive = false
+
+        DebugLog.log("Masuk otomatis: mulai (sudah terhubung: $connected, sedang menyambung: $connecting)")
+        withContext(Dispatchers.IO) {
+            ensurePump()
+            if (connected) {
+                scope.launch { startSession() }
+            } else {
+                connectIfIdle()
+            }
+        }
+
+        loggedOn.await()
+        DebugLog.log("Masuk otomatis: loggedOn diterima")
+        licenseSignal.await()
+        DebugLog.log("Masuk otomatis: daftar lisensi diterima")
     }
 
     /** Menyambung ke Steam kalau belum tersambung dan belum ada percobaan sambung yang berjalan. */
@@ -974,6 +1031,12 @@ class SteamRepository private constructor(context: Context) {
                 logOn(storedAccount, storedToken)
                 return
             }
+            if (!pendingQr && storedToken != null) {
+                DebugLog.log(
+                    "Token tersimpan tidak dipakai (Remember me: $pendingRemember, " +
+                        "akun cocok: ${typedUser.equals(storedAccount, ignoreCase = true)})"
+                )
+            }
 
             // Satu loop login per percobaan. Panggilan kedua (misalnya dari ConnectedCallback saat loop yang sama
             // masih menunggu sambungan pulih) tidak boleh membuat sesi baru.
@@ -1346,6 +1409,11 @@ class SteamRepository private constructor(context: Context) {
         private const val KEY_ACCOUNT = "account"
         private const val KEY_TOKEN = "refresh_token"
         private const val KEY_REMEMBER = "remember_me"
+        // Hasil logOn yang berarti token tidak berlaku lagi (bukan gangguan sementara)
+        private val TOKEN_REJECTED_RESULTS = setOf(
+            "InvalidPassword", "AccessDenied", "Expired", "Revoked", "InvalidLoginAuthCode",
+            "AccountLoginDeniedNeedTwoFactor", "TwoFactorCodeMismatch"
+        )
         private const val MAX_RECONNECT_RETRIES = 3
         private const val RECONNECT_WAIT_MS = 45_000L
         // Percobaan sambung yang tidak dijawab selama ini dianggap macet, jadi boleh dicoba lagi
