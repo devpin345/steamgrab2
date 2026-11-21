@@ -432,6 +432,12 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
             beginDownload(appId, platform, existing.library)
             return
         }
+        // Penyimpanan utama yang dipilih di awal dipakai langsung. Kalau sedang tidak tersambung, jatuh ke aturan lama.
+        val primary = Libraries.primaryRef()
+        if (primary != null && Libraries.primaryChosen) {
+            beginDownload(appId, platform, primary.library)
+            return
+        }
         val targets = Libraries.available()
         if (targets.size > 1) {
             _locationChoice.value = LocationChoice(

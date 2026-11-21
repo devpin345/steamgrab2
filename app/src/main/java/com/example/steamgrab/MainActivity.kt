@@ -56,6 +56,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -105,11 +106,16 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     // Urutan layar: login, kode Steam Guard, izin, info penyimpanan (pop-up), lalu daftar game.
     // Izin akses semua file diminta setelah login berhasil. Statusnya dicek ulang setiap aplikasi kembali ke layar
     // (setelah pengguna dari pengaturan), jadi saklar di layar izin menyala sendiri begitu izin diberikan.
+    val appContext = LocalContext.current
     var hasAccess by remember { mutableStateOf(Storage.hasAllFilesAccess()) }
+    var notifOn by remember { mutableStateOf(NotificationManagerCompat.from(appContext).areNotificationsEnabled()) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) hasAccess = Storage.hasAllFilesAccess()
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasAccess = Storage.hasAllFilesAccess()
+                notifOn = NotificationManagerCompat.from(appContext).areNotificationsEnabled()
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -127,10 +133,14 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
     // Pop-up info penyimpanan muncul setelah izin menyala, dan bisa dibuka lagi dari daftar game.
     var setupFinished by remember { mutableStateOf(Libraries.setupDone) }
     var showStorage by remember { mutableStateOf(false) }
+    // Layar "pilih disk utama" hanya muncul kalau ada penyimpanan eksternal, dan hanya sekali
+    var diskStepDone by remember { mutableStateOf(Libraries.primaryChosen) }
 
     val current = state
     val loggedOut = current is UiState.LoggedOut
-    val needsSetup = !loggedOut && (!hasAccess || !setupFinished)
+    // Kedua izin (penyimpanan dan notifikasi) harus menyala sebelum lanjut
+    val permsOk = hasAccess && notifOn
+    val needsSetup = !loggedOut && (!permsOk || !setupFinished)
     // Layar login, Steam Guard, dan izin berlatar gelap, jadi ikon status bar dibuat terang
     val darkScreen = loggedOut || needsSetup
     val view = LocalView.current
@@ -180,12 +190,25 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
                 )
             }
         } else if (needsSetup) {
-            PermissionScreen(storageGranted = hasAccess, blurred = hasAccess)
-            if (hasAccess) {
-                StoragePopup(setup = true, onDone = {
-                    Libraries.setupDone = true
-                    setupFinished = true
-                })
+            PermissionScreen(
+                storageGranted = hasAccess,
+                notificationGranted = notifOn,
+                onNotificationChanged = { notifOn = it },
+                blurred = permsOk
+            )
+            if (permsOk) {
+                val hasExternal = remember { Libraries.volumes().any { !it.primary } }
+                if (hasExternal && !diskStepDone) {
+                    PrimaryDiskPopup(onNext = { id ->
+                        Libraries.primaryId = id
+                        diskStepDone = true
+                    })
+                } else {
+                    StoragePopup(setup = true, onDone = {
+                        Libraries.setupDone = true
+                        setupFinished = true
+                    })
+                }
             }
         } else {
             // Layar biasa (latar putih): diberi jarak dari status bar dan ruang untuk tombol DEBUG di atas

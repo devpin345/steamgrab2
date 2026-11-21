@@ -37,6 +37,7 @@ data class LibraryRef(val volume: StorageVolumeInfo, val library: Library)
 object Libraries {
     private const val PRIMARY_ID = "primary"
     private const val KEY_SETUP_DONE = "setup_done"
+    private const val KEY_PRIMARY_DISK = "primary_disk"
 
     private var appContext: Context? = null
     private var prefs: SharedPreferences? = null
@@ -63,6 +64,27 @@ object Libraries {
         set(value) {
             prefs?.edit()?.putBoolean(KEY_SETUP_DONE, value)?.apply()
         }
+
+    /**
+     * Penyimpanan utama yang dipilih pengguna: tempat game baru diunduh tanpa bertanya lagi. Kosong sampai
+     * pengguna memilih, dan dianggap memori internal.
+     */
+    var primaryId: String
+        get() = prefs?.getString(KEY_PRIMARY_DISK, null) ?: PRIMARY_ID
+        set(value) {
+            prefs?.edit()?.putString(KEY_PRIMARY_DISK, value)?.apply()
+            refresh()
+        }
+
+    /** Pengguna sudah pernah memilih penyimpanan utama (layar "Please select the primary disk"). */
+    val primaryChosen: Boolean get() = prefs?.contains(KEY_PRIMARY_DISK) == true
+
+    /** Library di penyimpanan utama pilihan pengguna, selama penyimpanannya tersambung. Null kalau tidak tersambung. */
+    fun primaryRef(): LibraryRef? {
+        val id = primaryId
+        val volume = volumes().firstOrNull { it.id == id } ?: return null
+        return libraryDir(volume)?.let { LibraryRef(volume, Library(it)) }
+    }
 
     private fun defaultPrimaryLibrary(): File =
         File(Environment.getExternalStoragePublicDirectory("Download"), "SteamGames")
@@ -112,10 +134,14 @@ object Libraries {
         }
     }
 
-    /** Folder library yang diatur untuk penyimpanan ini. Null kalau belum diatur (penyimpanan eksternal baru). */
+    /**
+     * Folder library untuk penyimpanan ini: yang dipilih pengguna kalau ada. Selain itu memori internal memakai
+     * Download/SteamGames (supaya game lama tetap terbaca) dan penyimpanan eksternal memakai SteamGrab/SteamGames
+     * di akarnya, yang dibuat otomatis saat dipakai.
+     */
     fun libraryDir(volume: StorageVolumeInfo): File? {
         val saved = prefs?.getString("lib_${volume.id}", null)?.let { File(it) }
-        return saved ?: if (volume.primary) defaultPrimaryLibrary() else null
+        return saved ?: if (volume.primary) defaultPrimaryLibrary() else File(File(volume.root, "SteamGrab"), "SteamGames")
     }
 
     fun setLibraryDir(volume: StorageVolumeInfo, dir: File) {

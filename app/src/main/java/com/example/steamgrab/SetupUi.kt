@@ -9,6 +9,9 @@ import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -33,6 +36,7 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
@@ -52,6 +56,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
@@ -63,8 +68,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -334,39 +346,80 @@ private fun LanguageChip(modifier: Modifier = Modifier) {
         Spacer(Modifier.width(du.dp(13.6f)))
         GearIcon(Modifier.size(du.dp(29.2f)))
     }
-    if (open) {
-        val current by AppLanguage.code.collectAsState()
-        AlertDialog(
-            onDismissRequest = { open = false },
-            title = { Text("Language") },
-            text = {
-                Column {
-                    listOf("id" to "Bahasa Indonesia", "en" to "English").forEach { (code, name) ->
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    AppLanguage.set(code)
-                                    open = false
-                                }
-                                .padding(vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            RadioButton(selected = current == code, onClick = null)
-                            Spacer(Modifier.width(12.dp))
-                            Text(name)
+    if (open) LanguagePopup(onDismiss = { open = false })
+}
+
+/**
+ * Pilihan bahasa: kotak kecil di tengah layar dengan latar kaca gelap (efek blur dan gelap 50% di desain). Baris bahasa
+ * yang dipakai diberi sorotan.
+ */
+@Composable
+private fun LanguagePopup(onDismiss: () -> Unit) {
+    val du = LocalDu.current
+    val current by AppLanguage.code.collectAsState()
+    val center = remember {
+        object : PopupPositionProvider {
+            override fun calculatePosition(
+                anchorBounds: IntRect,
+                windowSize: IntSize,
+                layoutDirection: LayoutDirection,
+                popupContentSize: IntSize,
+            ): IntOffset = IntOffset(
+                (windowSize.width - popupContentSize.width) / 2,
+                (windowSize.height - popupContentSize.height) / 2
+            )
+        }
+    }
+    Popup(
+        popupPositionProvider = center,
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true)
+    ) {
+        val shape = RoundedCornerShape(du.dp(22f))
+        Box(
+            Modifier
+                .size(du.dp(355.6f), du.dp(158f))
+                .clip(shape)
+                .background(Color(0xE60B1119))
+                .border(du.dp(1.5f), Color(0x33FFFFFF), shape)
+        ) {
+            DText(
+                "Language", 24.2f,
+                modifier = Modifier.at(du, 0f, 11f).width(du.dp(355.6f)),
+                lineHeight = 30f, align = TextAlign.Center
+            )
+            Box(
+                Modifier
+                    .at(du, 25.9f, 41.1f)
+                    .size(du.dp(305.6f), du.dp(3f))
+                    .background(Color(0x99FFFFFF))
+            )
+            listOf("en" to "English", "id" to "Indonesia").forEachIndexed { index, (code, name) ->
+                val top = 56.3f + index * 40f
+                val selected = current == code
+                Box(
+                    Modifier
+                        .at(du, 14.9f, top)
+                        .size(du.dp(322.8f), du.dp(41f))
+                        .clip(RoundedCornerShape(du.dp(12f)))
+                        .background(if (selected) Color(0x55FFFFFF) else Color.Transparent)
+                        .clickable {
+                            AppLanguage.set(code)
+                            onDismiss()
                         }
-                    }
+                        .padding(start = du.dp(10.7f)),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    DText(name, 24.2f, lineHeight = 30f)
                 }
-            },
-            confirmButton = {}
-        )
+            }
+        }
     }
 }
 
 // Area desain layar login: dari tepi atas judul sampai ruang pesan di bawah kartu
-private const val LOGIN_TOP = 190f
-private const val LOGIN_CARD_BOTTOM = 1160.3f
+private const val LOGIN_TOP = 168f
+private const val LOGIN_CARD_BOTTOM = 1225.7f
 
 /** Satu kolom isian beserta labelnya, di posisi desain. */
 @Composable
@@ -481,35 +534,43 @@ fun LoginScreen(
             Box(Modifier.size(du.dp(810f), du.dp(LOGIN_CARD_BOTTOM + 150f - t))) {
                 DTextAt(
                     tr("Login ke akun Steam kamu", "Login to your Steam account"),
-                    x = 91.2f, capTop = 198.6f, size = 42.3f, origin = t, width = 700f, bold = true,
+                    x = 91.2f, capTop = 176.6f, size = 42.3f, origin = t, width = 700f, bold = true,
                     shadow = Shadow(Color(0x66000000), Offset(0f, 3f), 10f)
                 )
-                GlassPanel(Modifier.at(du, 81f, 264.4f - t).size(du.dp(648f), du.dp(895.9f))) {}
+                GlassPanel(Modifier.at(du, 81.6f, 243f - t).size(du.dp(647.8f), du.dp(982.7f))) {}
 
                 Box(
-                    fieldSurface(du, Modifier.at(du, 257.8f, 296.3f - t).size(du.dp(298.1f), du.dp(281.1f)))
+                    fieldSurface(du, Modifier.at(du, 258.3f, 274.8f - t).size(du.dp(298.1f), du.dp(281f)))
                 ) {
                     QrArea(du, loading, qrUrl, qrFailed, onRetryQr)
                 }
                 DTextAt(
-                    tr("Pindai dengan aplikasi Steam Mobile", "Scan with the Steam Mobile app"),
-                    x = 81f, capTop = 598f, size = 20f, origin = t, width = 648f,
-                    color = Color.White.copy(alpha = 0.65f), align = TextAlign.Center
+                    tr("Pindai kode QR dengan SteamApp", "Scan QR code with SteamApp"),
+                    x = 81.6f, capTop = 576f, size = 19f, origin = t, width = 647.8f,
+                    color = Color.White.copy(alpha = 0.85f), align = TextAlign.Center
+                )
+                // Garis pemisah dengan tulisan "Or" di tengah
+                Box(Modifier.at(du, 129.3f, 635.5f - t).size(du.dp(253.4f), du.dp(3f)).background(Color(0x66FFFFFF)))
+                Box(Modifier.at(du, 431.3f, 635.5f - t).size(du.dp(259.1f), du.dp(3f)).background(Color(0x66FFFFFF)))
+                DTextAt(
+                    tr("Atau", "Or"),
+                    x = 81.6f, capTop = 629f, size = 18f, origin = t, width = 647.8f,
+                    color = Color.White.copy(alpha = 0.5f), align = TextAlign.Center
                 )
 
                 DesignField(
-                    du, t, "Nickname", 643.2f, 680.9f, username, onUsername,
+                    du, t, "Nickname", 687.2f, 724f, username, onUsername,
                     KeyboardType.Text, ImeAction.Next, {}, VisualTransformation.None, !loading
                 )
                 DesignField(
-                    du, t, "Password", 802.7f, 840.5f, password, onPassword,
+                    du, t, "Password", 846.2f, 883.6f, password, onPassword,
                     KeyboardType.Password, ImeAction.Done, { if (canLogin) onLogin() },
                     if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     !loading
                 )
                 Box(
                     Modifier
-                        .at(du, 609.9f, 857.6f - t)
+                        .at(du, 610.9f, 901.1f - t)
                         .size(du.dp(53f))
                         .clip(CircleShape)
                         .clickable { passwordVisible = !passwordVisible },
@@ -520,7 +581,7 @@ fun LoginScreen(
                     }
                 }
 
-                val rememberTop = 950f
+                val rememberTop = 993f
                 Box(
                     Modifier
                         .at(du, 128.7f, rememberTop - t)
@@ -531,13 +592,13 @@ fun LoginScreen(
                         ) { onRemember(!remember) }
                 ) {
                     RememberCircle(remember, Modifier.at(du, 0f, 4.6f).size(du.dp(40.6f)))
-                    DTextAt("Remember me", x = 49.6f, capTop = 964.8f, size = 28.5f, origin = rememberTop)
+                    DTextAt("Remember me", x = 49.6f, capTop = 1007.8f, size = 28.5f, origin = rememberTop)
                 }
 
                 DesignButton(
                     text = tr("Kirim", "Send"),
                     onClick = onLogin,
-                    modifier = Modifier.at(du, 123.7f, 1038.3f - t).size(du.dp(566.3f), du.dp(80.7f)),
+                    modifier = Modifier.at(du, 123.7f, 1081.2f - t).size(du.dp(566.3f), du.dp(80.7f)),
                     textSize = 36.3f, radius = 20f, bold = true,
                     enabled = canLogin, loading = loading,
                     activeColor = GlassColors.Blue, idleColor = GlassColors.BlueIdle, idleTextColor = GlassColors.BlueIdleText
@@ -633,13 +694,7 @@ private fun CodeBoxes(
                                 .border(du.dp(2.5f), borderColor, shape),
                             contentAlignment = Alignment.Center
                         ) {
-                            DText(
-                                code.getOrNull(i)?.toString() ?: "",
-                                48.6f,
-                                bold = true,
-                                lineHeight = 62f,
-                                align = TextAlign.Center
-                            )
+                            RollingChar(code.getOrNull(i), du)
                         }
                     }
                 }
@@ -648,9 +703,43 @@ private fun CodeBoxes(
     }
 }
 
+/**
+ * Satu karakter kode yang berputar seperti mesin slot saat diketik: deretan karakter acak bergulir ke atas dan
+ * berhenti di karakter yang diketik.
+ */
+@Composable
+private fun RollingChar(ch: Char?, du: Du) {
+    if (ch == null) return
+    val cell = du.dp(83f)
+    val cellPx = with(LocalDensity.current) { cell.toPx() }
+    val progress = remember(ch) { Animatable(0f) }
+    LaunchedEffect(ch) { progress.animateTo(1f, tween(durationMillis = 520, easing = FastOutSlowInEasing)) }
+    val strip = remember(ch) {
+        val rnd = java.util.Random(ch.code * 31L + 7L)
+        List(ROLL_STEPS) { ROLL_ALPHABET[rnd.nextInt(ROLL_ALPHABET.length)] } + ch
+    }
+    Box(Modifier.fillMaxSize().clipToBounds()) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .wrapContentHeight(align = Alignment.Top, unbounded = true)
+                .offset { IntOffset(0, (-(strip.size - 1) * cellPx * progress.value).toInt()) }
+        ) {
+            strip.forEach { c ->
+                Box(Modifier.fillMaxWidth().height(cell), contentAlignment = Alignment.Center) {
+                    DText(c.toString(), 48.6f, bold = true, lineHeight = 62f, align = TextAlign.Center)
+                }
+            }
+        }
+    }
+}
+
+private const val ROLL_STEPS = 5
+private const val ROLL_ALPHABET = "0123456789ABCDEFGHJKMNPQRTVWXY"
+
 // Area desain layar Steam Guard: dari tepi atas perisai sampai ruang pesan di bawah kartu
-private const val GUARD_TOP = 300f
-private const val GUARD_CARD_BOTTOM = 1007f
+private const val GUARD_TOP = 279f
+private const val GUARD_CARD_BOTTOM = 985.3f
 
 /**
  * Layar Steam Guard: kode diketik di kotak lalu dikirim dengan tombol Kirim, atau login disetujui di aplikasi
@@ -727,9 +816,9 @@ fun GuardScreen(
                     painter = painterResource(R.drawable.steam_shield),
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.at(du, 303.4f, 312f - t).size(du.dp(203.2f), du.dp(243.8f))
+                    modifier = Modifier.at(du, 304.3f, 290.7f - t).size(du.dp(202f), du.dp(244.1f))
                 )
-                GlassPanel(Modifier.at(du, 81f, 589f - t).size(du.dp(648f), du.dp(418f))) {}
+                GlassPanel(Modifier.at(du, 81.6f, 567.4f - t).size(du.dp(647.8f), du.dp(417.9f))) {}
 
                 // Lima kotak (kode Steam Guard 5 karakter), ukuran tiap kotak sama dengan desain dan rata tengah kartu
                 CodeBoxes(
@@ -737,18 +826,18 @@ fun GuardScreen(
                     code = code,
                     enabled = inputEnabled,
                     hasError = state.wrongCode,
-                    modifier = Modifier.at(du, 192f, 640.4f - t).width(du.dp(426f)),
+                    modifier = Modifier.at(du, 192.5f, 623.5f - t).width(du.dp(426f)),
                     onCodeChange = { code = it },
                     onDone = { if (full) onSubmit(code) }
                 )
                 DTextAt(
-                    hint, x = 156.5f, capTop = 765.6f, size = 26.1f, origin = t, width = 497f,
+                    hint, x = 145.5f, capTop = 744f, size = 26.2f, origin = t, width = 520f,
                     lineHeight = 36.6f, align = TextAlign.Center, maxLines = 3
                 )
                 DesignButton(
                     text = buttonText,
                     onClick = { if (full) onSubmit(code) else onResend() },
-                    modifier = Modifier.at(du, 156.5f, 898.3f - t).size(du.dp(497f), du.dp(70.8f)),
+                    modifier = Modifier.at(du, 157f, 876.6f - t).size(du.dp(496.9f), du.dp(70.9f)),
                     textSize = 26.1f, radius = 22f, bold = false,
                     enabled = full || canResend, loading = state.loading,
                     activeColor = GlassColors.Purple, idleColor = GlassColors.PurpleIdle,
@@ -838,31 +927,24 @@ private fun DesignToggle(checked: Boolean, onClick: () -> Unit, modifier: Modifi
 }
 
 // Area desain layar izin: dari tepi atas ikon sampai di bawah kartu
-private const val PERM_TOP = 380f
+private const val PERM_TOP = 358.7f
 
 /**
- * Layar izin, setelah kode Steam Guard. Saklar penyimpanan mengikuti izin "akses semua file" yang sebenarnya, dan
- * membuka pengaturan saat diketuk. Notifikasi bersifat opsional. Begitu izin penyimpanan menyala, pop-up info
- * penyimpanan muncul di atas layar ini (lihat StoragePopup), dan [blurred] mengaburkan layar ini di belakangnya.
+ * Layar izin, setelah kode Steam Guard. Kedua saklar harus menyala supaya bisa lanjut: penyimpanan mengikuti izin
+ * "akses semua file" yang sebenarnya, notifikasi mengikuti izin notifikasi. Saklar yang mati membuka dialog atau
+ * pengaturannya. Setelah keduanya menyala, pop-up penyimpanan muncul di atas layar ini dan [blurred] mengaburkannya.
  */
 @Composable
-fun PermissionScreen(storageGranted: Boolean, blurred: Boolean) {
+fun PermissionScreen(
+    storageGranted: Boolean,
+    notificationGranted: Boolean,
+    onNotificationChanged: (Boolean) -> Unit,
+    blurred: Boolean,
+) {
     val context = LocalContext.current
-    var notifOn by remember { mutableStateOf(NotificationManagerCompat.from(context).areNotificationsEnabled()) }
     var notifAsked by remember { mutableStateOf(false) }
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        notifOn = NotificationManagerCompat.from(context).areNotificationsEnabled()
-    }
-    // Dicek ulang setiap kembali dari pengaturan
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                notifOn = NotificationManagerCompat.from(context).areNotificationsEnabled()
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onNotificationChanged(NotificationManagerCompat.from(context).areNotificationsEnabled())
     }
     val t = PERM_TOP
 
@@ -877,46 +959,46 @@ fun PermissionScreen(storageGranted: Boolean, blurred: Boolean) {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
-                Box(Modifier.size(du.dp(810f), du.dp(992.2f + 40f - t))) {
+                Box(Modifier.size(du.dp(810f), du.dp(970.5f + 40f - t))) {
                     Image(
                         painter = painterResource(R.drawable.ic_user_key),
                         contentDescription = null,
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.at(du, 353.5f, 390.3f - t).size(du.dp(153f), du.dp(165f))
+                        modifier = Modifier.at(du, 354.4f, 369f - t).size(du.dp(154.3f), du.dp(165.5f))
                     )
-                    GlassPanel(Modifier.at(du, 81f, 589f - t).size(du.dp(648f), du.dp(403.2f))) {}
+                    GlassPanel(Modifier.at(du, 81.6f, 567.4f - t).size(du.dp(647.8f), du.dp(403.1f))) {}
 
                     DTextAt(
                         tr("Izinkan", "Allow"),
-                        x = 137f, capTop = 629f, size = 42.3f, origin = t, width = 400f, bold = true,
+                        x = 137f, capTop = 608f, size = 42.3f, origin = t, width = 400f, bold = true,
                         shadow = Shadow(Color(0x66000000), Offset(0f, 3f), 8f)
                     )
                     DTextAt(
                         tr(
-                            "Beri izin aplikasi mengakses penyimpanan untuk menulis dan membaca data game",
-                            "Allow the app to access storage to write and read game data"
+                            "Beri izin aplikasi mengakses penyimpanan untuk menulis dan membaca data game.",
+                            "Give the app permission to access storage to write and read game data."
                         ),
-                        x = 133f, capTop = 700f, size = 26.1f, origin = t, width = 376f, lineHeight = 36f
+                        x = 133f, capTop = 679f, size = 26.1f, origin = t, width = 376f, lineHeight = 36f
                     )
                     DesignToggle(
                         checked = storageGranted,
                         onClick = { if (!storageGranted) openAllFilesAccessSettings(context) },
-                        modifier = Modifier.at(du, 592.6f, 702.9f - t)
+                        modifier = Modifier.at(du, 593f, 681.3f - t)
                     )
                     Box(
                         Modifier
-                            .at(du, 133f, 830.6f - t)
-                            .size(du.dp(544.9f), du.dp(3f))
+                            .at(du, 133.6f, 809f - t)
+                            .size(du.dp(549.6f), du.dp(3f))
                             .background(Color.White)
                     )
                     DTextAt(
-                        tr("Berikan akses notifikasi (Opsional)", "Allow notification access (Optional)"),
-                        x = 133f, capTop = 851.2f, size = 26.1f, origin = t, width = 376f, lineHeight = 36f
+                        tr("Berikan akses notifikasi", "Grant notification access"),
+                        x = 133f, capTop = 830f, size = 26.1f, origin = t, width = 376f, lineHeight = 36f
                     )
                     DesignToggle(
-                        checked = notifOn,
+                        checked = notificationGranted,
                         onClick = {
-                            if (!notifOn) {
+                            if (!notificationGranted) {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notifAsked) {
                                     notifAsked = true
                                     notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -926,7 +1008,7 @@ fun PermissionScreen(storageGranted: Boolean, blurred: Boolean) {
                                 }
                             }
                         },
-                        modifier = Modifier.at(du, 592.6f, 845.3f - t)
+                        modifier = Modifier.at(du, 593f, 824f - t)
                     )
                 }
             }

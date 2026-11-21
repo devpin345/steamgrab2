@@ -50,6 +50,8 @@ data class LibraryGame(
     val installDir: String,
     val flags: Int,
     val sizeOnDisk: Long,
+    // Nomor build dari appmanifest, ditampilkan sebagai versi game
+    val buildId: String = "",
 ) {
     val complete: Boolean get() = Storage.isComplete(flags)
 }
@@ -127,6 +129,7 @@ class Library(val root: File) {
                 installDir = vdfValue(text, "installdir") ?: "",
                 flags = stateFlagsRegex.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: Storage.STATE_PARTIAL,
                 sizeOnDisk = vdfValue(text, "SizeOnDisk")?.toLongOrNull() ?: 0L,
+                buildId = vdfValue(text, "buildid") ?: "",
             )
         }.sortedBy { it.name.lowercase() }
 
@@ -142,6 +145,24 @@ class Library(val root: File) {
         if (Storage.isComplete(flags)) return totalDownload
         val saved = bytesDownloadedRegex.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
         return if (totalDownload > 0L) saved.coerceIn(0L, totalDownload) else saved.coerceAtLeast(0L)
+    }
+
+    /**
+     * Menghapus game dari library ini: folder game, appmanifest, dan sisa unduhan sementara. Mengembalikan false kalau
+     * ada yang gagal dihapus. Folder di luar library tidak pernah disentuh.
+     */
+    fun deleteGame(game: LibraryGame): Boolean {
+        var ok = true
+        if (game.installDir.isNotBlank()) {
+            val dir = gameDir(game.installDir)
+            val safe = runCatching {
+                dir.canonicalPath.startsWith(commonDir().canonicalPath + File.separator)
+            }.getOrDefault(false)
+            if (safe) ok = dir.deleteRecursively() && ok else ok = false
+        }
+        File(File(steamLibraryDir(), "downloading"), game.appId.toString()).deleteRecursively()
+        manifestFile(game.appId).delete()
+        return ok && !manifestFile(game.appId).exists()
     }
 
     /** Ruang kosong di penyimpanan tempat library ini berada. */
