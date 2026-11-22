@@ -62,6 +62,12 @@ enum class GuardType { DEVICE, EMAIL, APPROVAL }
 /** QR login kedaluwarsa sebelum dipindai. Layar login membuat QR baru, ini bukan error yang ditampilkan. */
 class QrExpiredException : Exception("Kode QR kedaluwarsa")
 
+/** Login gagal dengan alasan yang sudah dijelaskan ke pengguna (password salah, dibatasi Steam, dan sebagainya). */
+class FriendlyLoginException(message: String, cause: Throwable?) : Exception(message, cause)
+
+/** Steam tidak menjawab permintaan sama sekali, tanda sambungan sudah mati diam-diam (misalnya setelah aplikasi lama di latar). */
+private class StalledConnectionException : Exception("Steam tidak menjawab")
+
 data class DepotChoice(val depotId: Int, val manifestId: Long, val download: Long?, val disk: Long?)
 
 /** Keadaan satu depot dari listener library: byte terkompresi, byte tidak terkompresi, dan persennya (0..1). */
@@ -249,10 +255,16 @@ class SteamRepository private constructor(context: Context) {
             }
         }
 
-        loggedOn.await()
-        DebugLog.log("login: loggedOn diterima")
-        licenseSignal.await()
-        DebugLog.log("login: daftar lisensi diterima")
+        try {
+            loggedOn.await()
+            DebugLog.log("login: loggedOn diterima")
+            licenseSignal.await()
+            DebugLog.log("login: daftar lisensi diterima")
+        } finally {
+            // Login ini sudah selesai atau gagal. Perubahan status koneksi sesudahnya (misalnya Steam memutus sambungan
+            // setelah password salah) tidak boleh lagi mengubah layar login.
+            if (this.onStatus === onStatus) this.onStatus = null
+        }
     }
 
     /**
@@ -273,6 +285,7 @@ class SteamRepository private constructor(context: Context) {
         pendingUser = null
         pendingPass = null
         pendingQr = true
+        onStatus = null
         onQrChallenge = onChallenge
         onGuardNeeded = null
         loggedOn = CompletableDeferred()
@@ -410,6 +423,7 @@ class SteamRepository private constructor(context: Context) {
      * tidak menyelesaikan login di belakang layar.
      */
     fun abortLogin() {
+        onStatus = null
         authGeneration.incrementAndGet()
         activeSession = null
         qrSession = null
@@ -1005,7 +1019,8 @@ class SteamRepository private constructor(context: Context) {
     /** Kegagalan karena koneksi putus (termasuk di dalam cause), bukan karena password atau kode salah. */
     private fun Throwable.isConnectionLoss(): Boolean =
         generateSequence(this) { it.cause }.any {
-            it is AsyncJobFailedException || it is java.util.concurrent.CancellationException
+            it is AsyncJobFailedException || it is java.util.concurrent.CancellationException ||
+                it is StalledConnectionException
         }
 
     /** Pesan yang lebih jelas untuk error dari library. */
@@ -1015,6 +1030,49 @@ class SteamRepository private constructor(context: Context) {
         } else {
             e
         }
+
+    /**
+     * Menunggu jawaban Steam paling lama [POLL_TIMEOUT_SECONDS]. Kalau tidak ada jawaban sama sekali, sambungan dianggap
+     * sudah mati diam-diam (biasanya setelah aplikasi lama di latar saat pengguna menyetujui login di aplikasi Steam)
+     * dan sambungan dibuat ulang, bukan menunggu selamanya di layar Steam Guard.
+     */
+    private fun <T> CompletableFuture<T>.getOrReconnect(): T =
+        try {
+            get(POLL_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            forceReconnect()
+            throw StalledConnectionException()
+        }
+
+    private val forcingReconnect = AtomicBoolean(false)
+
+    private fun forceReconnect() {
+        if (!forcingReconnect.compareAndSet(false, true)) return
+        DebugLog.log("Steam tidak menjawab dalam $POLL_TIMEOUT_SECONDS detik, sambungan dianggap mati dan dibuat ulang")
+        scope.launch {
+            try {
+                try {
+                    client.disconnect()
+                } catch (e: Throwable) {
+                    DebugLog.log("ERROR saat memutus sambungan yang mati: ${e.describe()}")
+                }
+                var waited = 0
+                while (client.isConnected && waited < 25) {
+                    delay(200L)
+                    waited++
+                }
+                connected = false
+                connecting = false
+                sessionActive = false
+                delay(500L)
+                connectIfIdle()
+            } catch (e: Throwable) {
+                DebugLog.log("ERROR saat menyambung ulang: ${e.describe()}")
+            } finally {
+                forcingReconnect.set(false)
+            }
+        }
+    }
 
     private fun ensurePump() {
         if (pumpStarted) return
@@ -1140,18 +1198,19 @@ class SteamRepository private constructor(context: Context) {
                 // Kredensial yang ditolak tidak dikirim lagi sampai pengguna menekan tombol login
                 loginRejected = true
                 pendingPass = null
+                onStatus = null
                 val qrMode = pendingQr
                 val shown: Throwable = when (e.authRejection()?.result) {
-                    EResult.Expired -> if (qrMode) QrExpiredException() else IllegalStateException(
+                    EResult.Expired -> if (qrMode) QrExpiredException() else FriendlyLoginException(
                         "Permintaan persetujuan di Steam Mobile sudah kedaluwarsa. Tekan Login untuk meminta yang baru.",
                         e
                     )
-                    EResult.InvalidPassword -> IllegalStateException(
+                    EResult.InvalidPassword -> FriendlyLoginException(
                         "Nama akun atau password salah. Isi dengan nama akun yang dipakai untuk login Steam " +
                             "(bukan nama profil), lalu periksa passwordnya.",
                         e
                     )
-                    EResult.RateLimitExceeded, EResult.AccountLoginDeniedThrottle -> IllegalStateException(
+                    EResult.RateLimitExceeded, EResult.AccountLoginDeniedThrottle -> FriendlyLoginException(
                         "Steam membatasi percobaan login untuk sementara. Tunggu beberapa menit, lalu coba lagi.",
                         e
                     )
@@ -1213,11 +1272,13 @@ class SteamRepository private constructor(context: Context) {
         // setelah sebelumnya menampilkan "menyambung ulang".
         onGuardNeeded?.invoke(GuardType.APPROVAL, false)
         val intervalMs = (session.pollingInterval * 1000f).toLong().coerceIn(2_000L, 5_000L)
+        var checks = 0
         while (true) {
             currentCoroutineContext().ensureActive()
             if (gen != authGeneration.get()) throw StaleLoginException()
-            val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).get() }
+            val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).getOrReconnect() }
             if (result != null) return result
+            if (++checks % 10 == 0) DebugLog.log("Masih menunggu persetujuan di Steam Mobile ($checks kali diperiksa)")
             delay(intervalMs)
         }
     }
@@ -1254,7 +1315,7 @@ class SteamRepository private constructor(context: Context) {
                 continue
             }
             try {
-                val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).get() }
+                val result = withContext(Dispatchers.IO) { session.pollAuthSessionStatus(scope).getOrReconnect() }
                 if (result != null) return result
                 transientFailures = 0
             } catch (e: Exception) {
@@ -1436,6 +1497,7 @@ class SteamRepository private constructor(context: Context) {
         private const val CONNECT_STALE_MS = 30_000L
         // Gangguan sesaat (bukan penolakan Steam) berturut-turut yang ditoleransi saat menunggu persetujuan
         private const val MAX_POLL_FAILURES = 3
+        private const val POLL_TIMEOUT_SECONDS = 20L
         // Persen yang ditampilkan tidak melewati ini sebelum download benar-benar selesai
         private const val MAX_FRACTION_BEFORE_DONE = 0.99
         private const val DATA_ACTIVITY = "Mengunduh, mendekompresi, dan menulis data game"

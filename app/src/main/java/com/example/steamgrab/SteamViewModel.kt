@@ -357,10 +357,11 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                             }
                         },
                         onStatus = { message ->
-                            // Hanya di layar login. Layar Steam Guard tetap tampil supaya kode bisa diketik lagi
-                            // setelah Steam meminta kode baru.
+                            // Hanya di layar login selama login ini masih berjalan. Layar Steam Guard tetap tampil
+                            // apa adanya supaya kode bisa diketik lagi setelah Steam meminta kode baru, dan pesan
+                            // lama yang datang terlambat tidak boleh menimpa layar yang sudah menampilkan error.
                             val current = _uiState.value
-                            if (current is UiState.LoggedOut) {
+                            if (loginJob?.isActive == true && current is UiState.LoggedOut && !current.needsGuardCode) {
                                 _uiState.value = current.copy(loading = true, error = null, status = message)
                             }
                         },
@@ -387,7 +388,10 @@ class SteamViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 DebugLog.log("ERROR saat $step: ${e.describe()}")
                 Log.e("SteamGrab", "Gagal saat $step", e)
-                _uiState.value = UiState.LoggedOut(error = "Gagal saat $step.\nDetail:\n${e.describe()}")
+                // Alasan yang sudah jelas (password salah, dibatasi Steam) ditampilkan apa adanya tanpa detail teknis
+                _uiState.value = UiState.LoggedOut(
+                    error = if (e is FriendlyLoginException) e.message else "Gagal saat $step.\nDetail:\n${e.describe()}"
+                )
             }
         }
     }
