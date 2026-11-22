@@ -1,5 +1,11 @@
 package com.example.steamgrab
 
+import androidx.annotation.DrawableRes
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.res.imageResource
+import kotlin.math.roundToInt
+import androidx.compose.foundation.layout.Spacer
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -144,37 +150,48 @@ internal object GlassColors {
     val Red = Color(0xFFE62D3B)
 }
 
-/** Latar halaman: gradasi biru tua dengan cahaya zaitun di pojok kiri atas dan logo Steam kabur di kanan bawah. */
+/**
+ * Latar halaman, diambil dari layer background di PDF desain (gradasi biru tua dengan cahaya zaitun di pojok kiri
+ * atas). Dekorasi tiap layar dan kartunya digambar lewat [PdfLayer] oleh layar itu sendiri.
+ */
 @Composable
 fun GlassBackground(content: @Composable BoxScope.() -> Unit) {
-    ProvideDu { du ->
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(Brush.verticalGradient(listOf(GlassColors.BgTop, GlassColors.BgBottom)))
-                .drawBehind {
-                    drawRect(
-                        Brush.radialGradient(
-                            colors = listOf(GlassColors.Olive, Color.Transparent),
-                            center = Offset.Zero,
-                            radius = size.width * 1.1f
-                        )
-                    )
-                }
-        ) {
-            // Logo di desain: 940 satuan, mulai dari x=210.6, tepi atasnya di y=631.3 pada halaman setinggi 1440
+    ProvideDu { _ ->
+        Box(Modifier.fillMaxSize()) {
             Image(
-                painter = painterResource(R.drawable.steam_logo_blur),
+                painter = painterResource(R.drawable.pg_bg),
                 contentDescription = null,
-                alpha = 0.5f,
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .offset(x = du.dp(341f), y = du.dp(131.8f))
-                    .size(du.dp(940f))
+                contentScale = ContentScale.FillBounds,
+                modifier = Modifier.fillMaxSize()
             )
             content()
         }
     }
+}
+
+/**
+ * Satu layer gambar dari PDF desain, digambar di posisi dan ukuran aslinya (satuan desain, dari pojok kiri atas
+ * kotak tempat layer ini dipasang). Digambar langsung, bukan sebagai anak tata letak, supaya boleh lebih besar atau
+ * keluar dari kotak induknya seperti bayangan kartu dan logo besar di desain. Letakkan sebelum elemen lain supaya
+ * berada di bawahnya.
+ */
+@Composable
+internal fun PdfLayer(@DrawableRes res: Int, du: Du, x: Float, y: Float, w: Float, h: Float) {
+    val image = ImageBitmap.imageResource(res)
+    Spacer(
+        Modifier
+            .size(1.dp)
+            .drawBehind {
+                drawImage(
+                    image = image,
+                    srcOffset = IntOffset.Zero,
+                    srcSize = IntSize(image.width, image.height),
+                    dstOffset = IntOffset(du.dp(x).toPx().roundToInt(), du.dp(y).toPx().roundToInt()),
+                    dstSize = IntSize(du.dp(w).toPx().roundToInt(), du.dp(h).toPx().roundToInt()),
+                    filterQuality = FilterQuality.High
+                )
+            }
+    )
 }
 
 /** Kartu kaca: gradasi ungu ke biru tua dengan garis tepi ungu ke biru. */
@@ -532,12 +549,14 @@ fun LoginScreen(
             verticalArrangement = Arrangement.Center
         ) {
             Box(Modifier.size(du.dp(810f), du.dp(LOGIN_CARD_BOTTOM + 150f - t))) {
+                // Layer dari PDF: logo Steam besar yang samar (30%), lalu kartu kaca beserta bayangannya
+                PdfLayer(R.drawable.login_deco, du, 211.5f, 610.0f - t, 939.9f, 939.9f)
+                PdfLayer(R.drawable.login_card, du, -134.0f, 27.3f - t, 1080.6f, 1414.5f)
                 DTextAt(
                     tr("Login ke akun Steam kamu", "Login to your Steam account"),
                     x = 91.2f, capTop = 176.6f, size = 42.3f, origin = t, width = 700f, bold = true,
                     shadow = Shadow(Color(0x66000000), Offset(0f, 3f), 10f)
                 )
-                GlassPanel(Modifier.at(du, 81.6f, 243f - t).size(du.dp(647.8f), du.dp(982.7f))) {}
 
                 Box(
                     fieldSurface(du, Modifier.at(du, 258.3f, 274.8f - t).size(du.dp(298.1f), du.dp(281f)))
@@ -812,13 +831,14 @@ fun GuardScreen(
             verticalArrangement = Arrangement.Center
         ) {
             Box(Modifier.size(du.dp(810f), du.dp(GUARD_CARD_BOTTOM + 150f - t))) {
+                PdfLayer(R.drawable.guard_deco, du, 209.8f, 743.1f - t, 774.4f, 931.5f)
+                PdfLayer(R.drawable.guard_card, du, -134.0f, 352.2f - t, 1080.6f, 852.6f)
                 Image(
                     painter = painterResource(R.drawable.steam_shield),
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.at(du, 304.3f, 290.7f - t).size(du.dp(202f), du.dp(244.1f))
                 )
-                GlassPanel(Modifier.at(du, 81.6f, 567.4f - t).size(du.dp(647.8f), du.dp(417.9f))) {}
 
                 // Lima kotak (kode Steam Guard 5 karakter), ukuran tiap kotak sama dengan desain dan rata tengah kartu
                 CodeBoxes(
@@ -955,13 +975,14 @@ fun PermissionScreen(
                 verticalArrangement = Arrangement.Center
             ) {
                 Box(Modifier.size(du.dp(810f), du.dp(970.5f + 40f - t))) {
+                    PdfLayer(R.drawable.perm_deco, du, 280.9f, 667.9f - t, 746.3f, 808.1f)
+                    PdfLayer(R.drawable.perm_card, du, -134.0f, 352.2f - t, 1080.6f, 837.4f)
                     Image(
                         painter = painterResource(R.drawable.ic_user_key),
                         contentDescription = null,
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.at(du, 354.4f, 369f - t).size(du.dp(154.3f), du.dp(165.5f))
                     )
-                    GlassPanel(Modifier.at(du, 81.6f, 567.4f - t).size(du.dp(647.8f), du.dp(403.1f))) {}
 
                     DTextAt(
                         tr("Izinkan", "Allow"),
