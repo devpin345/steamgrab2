@@ -856,12 +856,8 @@ fun GuardScreen(
                             DText(it, 22f, color = GlassColors.Error, lineHeight = 30f)
                         }
                     }
-                    state.status?.let {
-                        DText(
-                            it, 22f, color = Color.White.copy(alpha = 0.85f), lineHeight = 30f,
-                            align = TextAlign.Center
-                        )
-                    }
+                    // Teks status ("Koneksi ke Steam terputus, menyambung ulang..." dan sejenisnya) sengaja tidak
+                    // ditampilkan di sini, sesuai permintaan. Kesalahan tetap tampil di atas.
                 }
             }
         }
@@ -932,14 +928,13 @@ private const val PERM_TOP = 358.7f
 /**
  * Layar izin, setelah kode Steam Guard. Kedua saklar harus menyala supaya bisa lanjut: penyimpanan mengikuti izin
  * "akses semua file" yang sebenarnya, notifikasi mengikuti izin notifikasi. Saklar yang mati membuka dialog atau
- * pengaturannya. Setelah keduanya menyala, pop-up penyimpanan muncul di atas layar ini dan [blurred] mengaburkannya.
+ * pengaturannya. Setelah keduanya menyala, pop-up penyimpanan muncul di atas layar ini.
  */
 @Composable
 fun PermissionScreen(
     storageGranted: Boolean,
     notificationGranted: Boolean,
     onNotificationChanged: (Boolean) -> Unit,
-    blurred: Boolean,
 ) {
     val context = LocalContext.current
     var notifAsked by remember { mutableStateOf(false) }
@@ -948,7 +943,7 @@ fun PermissionScreen(
     }
     val t = PERM_TOP
 
-    Box(if (blurred) Modifier.blur(18.dp) else Modifier) {
+    Box {
         GlassBackground {
             val du = LocalDu.current
             Column(

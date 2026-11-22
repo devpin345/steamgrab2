@@ -193,8 +193,7 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             PermissionScreen(
                 storageGranted = hasAccess,
                 notificationGranted = notifOn,
-                onNotificationChanged = { notifOn = it },
-                blurred = permsOk
+                onNotificationChanged = { notifOn = it }
             )
             if (permsOk) {
                 val hasExternal = remember { Libraries.volumes().any { !it.primary } }
@@ -215,7 +214,6 @@ fun SteamGrabApp(vm: SteamViewModel = viewModel()) {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .then(if (showStorage) Modifier.blur(16.dp) else Modifier)
                     .statusBarsPadding()
                     .navigationBarsPadding()
                     .padding(top = 28.dp)

@@ -138,37 +138,55 @@ private fun rememberVolumes(version: Int): List<StorageVolumeInfo> {
     }
 }
 
-/** Latar penuh layar untuk pop-up: meredupkan layar di belakang dan menahan ketukan supaya tidak tembus. */
+/**
+ * Lapisan untuk pop-up. Layar di belakang tidak diburamkan dan tidak digelapkan, seperti di desain: hanya jendela
+ * pop-up yang berefek kaca. Lapisan ini menahan ketukan supaya tidak tembus, dan menunggu foto layar siap sebelum
+ * jendelanya digambar.
+ */
 @Composable
 private fun PopupOverlay(onOutsideTap: (() -> Unit)? = null, content: @Composable (Du) -> Unit) {
+    val glass = rememberGlass()
     ProvideDu { du ->
         Box(
             Modifier
                 .fillMaxSize()
-                .background(Color(0x4D000000))
                 .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
-                    onOutsideTap?.invoke()
+                    if (glass.ready) onOutsideTap?.invoke()
                 },
             contentAlignment = Alignment.Center
         ) {
-            Box(Modifier.systemBarsPadding(), contentAlignment = Alignment.Center) { content(du) }
+            if (glass.ready) {
+                CompositionLocalProvider(LocalGlassBackdrop provides glass.backdrop) {
+                    Box(Modifier.systemBarsPadding(), contentAlignment = Alignment.Center) { content(du) }
+                }
+            }
         }
     }
 }
 
-/** Kotak kaca gelap dengan garis tepi ungu ke biru. Di Android 12 ke atas layar di belakangnya sudah diburamkan. */
+/** Gaya garis tepi jendela kaca, diambil dari warna piksel di PDF desain. */
+private enum class SheetBorder { MAIN, FADE }
+
+private val MAIN_BORDER = Brush.linearGradient(listOf(Color(0xFF653AFD), Color(0xFF2B4668)))
+private val FADE_BORDER = Brush.verticalGradient(listOf(Color(0x52FFFFFF), Color(0x0DFFFFFF)))
+
+/**
+ * Jendela kaca. [SheetBorder.MAIN] (ungu ke biru) untuk jendela utama, [SheetBorder.FADE] (putih yang memudar ke
+ * bawah) untuk jendela info game dan menu. Garis tepi digambar paling atas.
+ */
 @Composable
-private fun GlassSheet(modifier: Modifier, radius: Float = 24f, content: @Composable BoxScope.() -> Unit) {
+private fun GlassSheet(
+    modifier: Modifier,
+    radius: Float = 24f,
+    border: SheetBorder = SheetBorder.MAIN,
+    content: @Composable BoxScope.() -> Unit,
+) {
     val du = LocalDu.current
-    val shape = RoundedCornerShape(du.dp(radius))
-    val seeThrough = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-    val top = if (seeThrough) Color(0xC4172131) else Color(0xF2172131)
-    val bottom = if (seeThrough) Color(0xE60B121B) else Color(0xFA0B121B)
-    Box(
-        modifier
-            .clip(shape)
-            .background(Brush.verticalGradient(listOf(top, bottom)))
-            .border(du.dp(2.5f), Brush.linearGradient(listOf(Color(0xFF6341FF), Color(0xFF2D4A7A))), shape),
+    GlassBox(
+        shape = RoundedCornerShape(du.dp(radius)),
+        borderWidth = du.dp(if (border == SheetBorder.MAIN) 3f else 2.2f),
+        borderBrush = if (border == SheetBorder.MAIN) MAIN_BORDER else FADE_BORDER,
+        modifier = modifier,
         content = content
     )
 }
@@ -735,8 +753,9 @@ private fun GameMenu(canMove: Boolean, onDelete: () -> Unit, onMove: () -> Unit,
         Modifier
             .width(du.dp(168.3f))
             .clip(shape)
-            .background(Color(0xEB101820))
-            .border(du.dp(2f), Color(0xB3FFFFFF), shape)
+            // Hampir tidak tembus pandang seperti di desain, supaya tulisan di baris game di belakangnya tidak terlihat
+            .background(Color(0xF50A1016))
+            .border(du.dp(2.2f), FADE_BORDER, shape)
             .padding(vertical = du.dp(12f))
     ) {
         kinds.forEachIndexed { index, kind ->
@@ -861,9 +880,14 @@ private fun GameInfoPopup(game: LibraryGame, volume: StorageVolumeInfo, libDir: 
     val extra by produceState<GameExtra?>(GameInfoStore.cached(game.appId), game.appId) {
         value = GameInfoStore.load(game.appId) ?: value
     }
-    val banner by produceState<Bitmap?>(GameImages.cached(game.appId), game.appId) {
-        value = GameImages.load(game.appId) ?: value
+    // Gambar hero tanpa judul seperti di desain. Kalau game tidak punya, dipakai gambar header toko.
+    val hero by produceState<Bitmap?>(GameImages.cachedHero(game.appId), game.appId) {
+        value = GameImages.loadHero(game.appId) ?: value
     }
+    val header by produceState<Bitmap?>(GameImages.cached(game.appId), game.appId) {
+        if (hero == null) value = GameImages.load(game.appId) ?: value
+    }
+    val banner = hero ?: header
     val platform = PlatformStore.get(game.appId) ?: Platform.WINDOWS
     val platformIcon = when (platform) {
         Platform.LINUX -> R.drawable.ic_linux
@@ -878,7 +902,7 @@ private fun GameInfoPopup(game: LibraryGame, volume: StorageVolumeInfo, libDir: 
                 // Ketukan di dalam jendela tidak menutupnya
                 .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {}
         ) {
-            GlassSheet(Modifier.fillMaxSize(), radius = 40f) {}
+            GlassSheet(Modifier.fillMaxSize(), radius = 40f, border = SheetBorder.FADE) {
 
             DTextAt(
                 tr("Informasi game", "Information about games"),
@@ -923,7 +947,8 @@ private fun GameInfoPopup(game: LibraryGame, volume: StorageVolumeInfo, libDir: 
                 lineHeight = 58f, maxLines = 1,
                 shadow = Shadow(Color(0x99000000), Offset(0f, 3f), 8f)
             )
-            val maker = extra?.publisher ?: extra?.developer
+            // Pengembang selalu ditampilkan begitu data selesai dimuat, "-" kalau Steam tidak punya datanya
+            val maker = extra?.publisher ?: extra?.developer ?: if (extra != null) "-" else null
             if (maker != null) {
                 DTextAt(
                     maker, x = 41f - INFO_X, capTop = 622f, size = 25f, origin = o, width = 600f,
@@ -975,7 +1000,7 @@ private fun GameInfoPopup(game: LibraryGame, volume: StorageVolumeInfo, libDir: 
                 pathLabel(volume, libDir), x = 41f - INFO_X, capTop = 800f, size = 25f, origin = o, width = 640f,
                 maxLines = 1
             )
-            val build = game.buildId.ifBlank { "-" }
+            val build = game.buildId.takeIf { it.isNotBlank() && it != "0" } ?: "-"
             DTextAt(
                 tr(
                     "Versi: $build  Ukuran: ${formatBytes(game.sizeOnDisk)}",
@@ -995,6 +1020,7 @@ private fun GameInfoPopup(game: LibraryGame, volume: StorageVolumeInfo, libDir: 
                     alpha = 0.9f,
                     modifier = Modifier.at(du, 702.8f - INFO_X, 804.1f - o).size(du.dp(53.3f))
                 )
+            }
             }
         }
     }

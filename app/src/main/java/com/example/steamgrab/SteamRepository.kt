@@ -489,6 +489,22 @@ class SteamRepository private constructor(context: Context) {
                     app.keyValues["common"]["clienticon"].asString(),
                     app.keyValues["common"]["icon"].asString()
                 )
+                // Pengembang dan penerbit dari data app, cadangan untuk jendela info game
+                runCatching {
+                    val kv = app.keyValues
+                    val assoc = kv["common"]["associations"].children
+                    fun associated(type: String): String? = assoc
+                        .filter { it["type"].asString() == type }
+                        .mapNotNull { it["name"].asString() }
+                        .joinToString(", ")
+                        .ifBlank { null }
+                    GameInfoStore.recordPics(
+                        app.id,
+                        kv["extended"]["developer"].asString() ?: associated("developer"),
+                        kv["extended"]["publisher"].asString() ?: associated("publisher"),
+                        kv["common"]["review_percentage"].asString()?.toIntOrNull()
+                    )
+                }
                 appInfos[app.id] = app.keyValues
             }
         }
